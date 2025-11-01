@@ -40,8 +40,8 @@ python -c "import torch; print(f'MPS: {torch.backends.mps.is_available()}')"
 
 #### **Linux (CUDA GPU)**
 ```bash
-# Install PyTorch with CUDA 11.8 (adjust cu121, cu117 as needed)
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+# Install PyTorch with CUDA 12.6
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
 
 # Install project + dev tools
 pip install -e .[dev]
