@@ -1,25 +1,24 @@
+from . import vocabularies
+
 DEFAULT_SAMPLE_RATE = 16000
 DEFAULT_HOP_WIDTH = 128
 DEFAULT_NUM_MEL_BINS = 512
 FFT_SIZE = 2048
 MEL_LO_HZ = 20.0
 MEL_FMIN = 20.0
-MEL_FMAX = 7600.0
+MEL_FMAX = 8000.0  # Set to Nyquist frequency (sample_rate / 2) to avoid empty filters
 
-RANGE_NOTE_ON = 128
-RANGE_NOTE_OFF = 128
-RANGE_VEL = 128
-RANGE_TIME_SHIFT = 205
+PREPEND_ZEROS_WIDTH = 4
 
-START_IDX = {
-    'note_on': 0,
-    'note_off': RANGE_NOTE_ON,
-    'time_shift': RANGE_NOTE_ON + RANGE_NOTE_OFF,
-    'velocity': RANGE_NOTE_ON + RANGE_NOTE_OFF + RANGE_TIME_SHIFT
-}
+# Build codec and vocabulary
+VOCAB_CONFIG = vocabularies.VocabularyConfig()
+codec = vocabularies.build_codec(VOCAB_CONFIG)
+vocab = vocabularies.GenericTokenVocabulary(codec.num_classes)
 
-TOKEN_END               = RANGE_NOTE_ON + RANGE_NOTE_OFF + RANGE_VEL + RANGE_TIME_SHIFT
-TOKEN_START             = TOKEN_END + 1
-TOKEN_PAD               = TOKEN_START + 1
-VOCAB_SIZE              = TOKEN_PAD + 1
-PREPEND_ZEROS_WIDTH     = 4
+# Token types
+TOKEN_END = vocab.eos_id
+TOKEN_START = -1  # This is not used in the new implementation
+TOKEN_PAD = 0
+
+# Vocabulary size
+VOCAB_SIZE = vocab.vocab_size

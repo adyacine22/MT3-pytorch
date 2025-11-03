@@ -41,7 +41,8 @@ python -c "import torch; print(f'MPS: {torch.backends.mps.is_available()}')"
 #### **Linux (CUDA GPU)**
 ```bash
 # Install PyTorch with CUDA 12.6
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
+pip install torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cu126
+
 
 # Install project + dev tools
 pip install -e .[dev]
@@ -71,7 +72,7 @@ pip install -e .[dev]
 | Dataset | Size | Split | Download |
 |---------|------|-------|----------|
 | **MAESTRO v2.0.0** | 101GB (120GB uncompressed) | train/valid/test | [Download website](https://magenta.withgoogle.com/datasets/maestro#v300) |
-| **SLAKH2100** | ~1.5 TB | train/valid/test | [Download website](https://zenodo.org/records/4599666) |
+| **SLAKH2100** | ~100GB| train/valid/test | [Download website](https://zenodo.org/records/4599666) |
 
 **Setup:**
 ```bash

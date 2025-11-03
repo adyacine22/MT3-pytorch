@@ -1,0 +1,179 @@
+[project]
+name = "mt3-pytorch"
+version = "0.1.0"
+description = "PyTorch implementation of MT3 (Multi-Track Music Transcription with Transformers)"
+authors = [
+    {name = "MT3-PyTorch Contributors"}
+]
+readme = "README.md"
+requires-python = ">=3.8,<3.14"
+license = {text = "MIT"}
+
+keywords = [
+    "music transcription",
+    "transformers",
+    "pytorch",
+    "audio processing",
+    "MIDI",
+    "deep learning"
+]
+
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Sound/Audio :: Analysis",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [    
+    # Audio processing
+    "librosa>=0.10.0",
+    "soundfile>=0.12.0",
+    "audioread>=3.0.0",
+    
+    # MIDI processing (NumPy 2.x compatible)
+    "pretty_midi>=0.2.11",
+    "note-seq>=0.0.5",
+    "mir_eval>=0.7",
+    
+    # Data processing
+    "numpy>=1.24.0",
+    "scipy>=1.10.0",
+    "pandas>=2.0.0",
+    
+    # Training utilities
+    "pytorch-lightning>=2.0.0",
+    "tensorboard>=2.13.0",
+    
+    # Utilities
+    "tqdm>=4.65.0",
+    "pyyaml>=6.0",
+    "einops>=0.6.0",
+]
+
+[project.optional-dependencies]
+# Development dependencies
+dev = [
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+    "black>=23.0.0",
+    "isort>=5.12.0",
+    "flake8>=6.0.0",
+    "mypy>=1.4.0",
+]
+
+# Additional dataset support
+datasets = [
+    "tfrecord>=1.14.0",  # For TFRecord datasets (optional)
+    "pydub>=0.25.0",
+]
+
+# Jupyter notebook support
+notebook = [
+    "jupyter>=1.0.0",
+    "ipykernel>=6.0.0",
+    "matplotlib>=3.7.0",
+    "seaborn>=0.12.0",
+]
+
+# Full installation with all extras
+all = [
+    "mt3-pytorch[dev,datasets,notebook]",
+]
+
+[project.urls]
+Homepage = "https://github.com/adyacine22/MT3-pytorch"
+Repository = "https://github.com/adyacine22/MT3-pytorch"
+Documentation = "https://github.com/adyacine22/MT3-pytorch/blob/main/README.md"
+"Bug Tracker" = "https://github.com/adyacine22/MT3-pytorch/issues"
+
+[build-system]
+requires = ["setuptools>=65.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["config", "model", "data", "tests"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = [
+    "-v",
+    "--strict-markers",
+    "--tb=short",
+    "--cov=.",
+    "--cov-report=term-missing",
+    "--cov-report=html",
+]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "integration: marks tests as integration tests",
+    "unit: marks tests as unit tests",
+    "cuda: marks tests that require CUDA",
+    "mps: marks tests that require MPS (Apple Silicon)",
+]
+
+[tool.coverage.run]
+source = ["config", "model", "data"]
+omit = [
+    "*/tests/*",
+    "*/test_*.py",
+    "*/__pycache__/*",
+    "*/venv/*",
+    "*/datasets/*",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+    "class .*\\bProtocol\\):",
+    "@(abc\\.)?abstractmethod",
+]
+
+[tool.black]
+line-length = 100
+target-version = ['py38', 'py39', 'py310', 'py311', 'py312', 'py313']
+include = '\.pyi?$'
+exclude = '''
+/(
+    \.git
+  | \.venv
+  | venv
+  | \.eggs
+  | \.tox
+  | build
+  | dist
+  | __pycache__
+  | datasets
+)/
+'''
+
+[tool.isort]
+profile = "black"
+line_length = 100
+skip = [".gitignore", ".dockerignore", "venv", ".venv", "datasets"]
+skip_glob = ["**/migrations/*"]
+
+[tool.mypy]
+python_version = "3.8"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+ignore_missing_imports = true
+exclude = ["venv", ".venv", "datasets", "test_outputs"]

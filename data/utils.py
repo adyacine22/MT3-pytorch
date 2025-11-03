@@ -1,244 +1,326 @@
-"""
-To Process Midi Files by preprocessing algorithm suggested by Magenta, 
-referenced https://github.com/jason9693/midi-neural-processor/blob/bea0dc612b7f687f964d0f6d54d1dbf117ae1307/processor.py
-"""
-
-import pretty_midi
-from data.constants import *
-
-
-class SustainAdapter:
-    def __init__(self, time, type):
-        self.start =  time
-        self.type = type
+import torch
+import numpy as np
+from . import vocabularies
+import note_seq
+import dataclasses
+from typing import Any, Dict, List, MutableMapping, Optional, Tuple
 
 
-class SustainDownManager:
-    def __init__(self, start, end):
-        self.start = start
-        self.end = end
-        self.managed_notes = []
-        self._note_dict = {} # key: pitch, value: note.start
-
-    def add_managed_note(self, note: pretty_midi.Note):
-        self.managed_notes.append(note)
-
-    def transposition_notes(self):
-        for note in reversed(self.managed_notes):
-            try:
-                note.end = self._note_dict[note.pitch]
-            except KeyError:
-                note.end = max(self.end, note.end)
-            self._note_dict[note.pitch] = note.start
+def shift_tokens(
+    tokens: torch.Tensor, start_token: int = vocabularies.DECODED_EOS_ID
+) -> torch.Tensor:
+    """Shifts the tokens for autoregressive input."""
+    shifted_tokens = torch.zeros_like(tokens)
+    shifted_tokens[..., 1:] = tokens[..., :-1]
+    shifted_tokens[..., 0] = start_token
+    return shifted_tokens
 
 
-# Divided note by note_on, note_off
-class SplitNote:
-    def __init__(self, type, time, value, velocity):
-        ## type: note_on, note_off
-        self.type = type
-        self.time = time
-        self.velocity = velocity
-        self.value = value
+class ContinuousInputsEncDecFeatureConverter:
+    """Converts features for a continuous input encoder-decoder model."""
 
-    def __repr__(self):
-        return '<[SNote] time: {} type: {}, value: {}, velocity: {}>'\
-            .format(self.time, self.type, self.value, self.velocity)
+    def __init__(self, pack: bool = False):
+        self.pack = pack
 
+    def __call__(self, features: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """Converts a dictionary of features.
 
-class Event:
-    def __init__(self, event_type, value):
-        self.type = event_type
-        self.value = value
+        Args:
+            features: A dictionary containing 'inputs' and 'targets'.
 
-    def __repr__(self):
-        return '<Event type: {}, value: {}>'.format(self.type, self.value)
+        Returns:
+            A dictionary with the converted features.
+        """
+        decoder_input_tokens = shift_tokens(features["targets"])
 
-    def to_int(self):
-        return START_IDX[self.type] + self.value
+        d = {
+            "encoder_input_tokens": features["inputs"],
+            "decoder_target_tokens": features["targets"],
+            "decoder_input_tokens": decoder_input_tokens,
+            "decoder_loss_weights": (features["targets"] != 0).to(torch.int32),
+        }
 
-    @staticmethod
-    def from_int(int_value):
-        info = Event._type_check(int_value)
-        return Event(info['type'], info['value'])
+        if self.pack:
+            # Packing is not yet implemented
+            pass
 
-    @staticmethod
-    def _type_check(int_value):
-        range_note_on = range(0, RANGE_NOTE_ON)
-        range_note_off = range(RANGE_NOTE_ON, RANGE_NOTE_ON+RANGE_NOTE_OFF)
-        range_time_shift = range(RANGE_NOTE_ON+RANGE_NOTE_OFF,RANGE_NOTE_ON+RANGE_NOTE_OFF+RANGE_TIME_SHIFT)
-
-        valid_value = int_value
-
-        if int_value in range_note_on:
-            return {'type': 'note_on', 'value': valid_value}
-        elif int_value in range_note_off:
-            valid_value -= RANGE_NOTE_ON
-            return {'type': 'note_off', 'value': valid_value}
-        elif int_value in range_time_shift:
-            valid_value -= (RANGE_NOTE_ON + RANGE_NOTE_OFF)
-            return {'type': 'time_shift', 'value': valid_value}
-        else:
-            valid_value -= (RANGE_NOTE_ON + RANGE_NOTE_OFF + RANGE_TIME_SHIFT)
-            return {'type': 'velocity', 'value': valid_value}
+        return d
 
 
-def _divide_note(notes):
-    result_array = []
-    notes.sort(key=lambda x: x.start)
-
-    for note in notes:
-        on = SplitNote('note_on', note.start, note.pitch, note.velocity)
-        off = SplitNote('note_off', note.end, note.pitch, None)
-        result_array += [on, off]
-    return result_array
+@dataclasses.dataclass
+class TimedEvent:
+    time: float
+    type: str
+    value: Any
 
 
-def _merge_note(snote_sequence):
-    note_on_dict = {}
-    result_array = []
-
-    for snote in snote_sequence:
-        # print(note_on_dict)
-        if snote.type == 'note_on':
-            note_on_dict[snote.value] = snote
-        elif snote.type == 'note_off':
-            try:
-                on = note_on_dict[snote.value]
-                off = snote
-                if off.time - on.time == 0:
-                    continue
-                result = pretty_midi.Note(on.velocity, snote.value, on.time, off.time)
-                result_array.append(result)
-            except:
-                print('info removed pitch: {}'.format(snote.value))
-    return result_array
-
-
-def _snote2events(snote: SplitNote, prev_vel: int):
-    result = []
-    if snote.velocity is not None:
-        modified_velocity = snote.velocity // 4
-        if prev_vel != modified_velocity:
-            result.append(Event(event_type='velocity', value=modified_velocity))
-    result.append(Event(event_type=snote.type, value=snote.value))
-    return result
+def note_sequence_to_timed_events(ns: note_seq.NoteSequence) -> List[TimedEvent]:
+    """Converts a NoteSequence to a list of timed events."""
+    events: List[TimedEvent] = []
+    for note in ns.notes:
+        events.append(
+            TimedEvent(
+                note.start_time,
+                "note_on",
+                (note.pitch, note.velocity, note.program, note.is_drum),
+            )
+        )
+        events.append(
+            TimedEvent(
+                note.end_time, "note_off", (note.pitch, note.program, note.is_drum)
+            )
+        )
+    events.sort(key=lambda e: e.time)
+    return events
 
 
-def _event_seq2snote_seq(event_sequence):
-    timeline = 0
-    velocity = 0
-    snote_seq = []
+def timed_events_to_tokens(
+    events: List[TimedEvent], codec: vocabularies.Codec, frame_times: np.ndarray
+) -> Tuple[List[int], List[int], List[int]]:
+    """Converts a list of timed events to a sequence of tokens."""
+    tokens: List[int] = []
+    event_start_indices: List[int] = []
+    current_time: float = 0.0
+    token_idx: int = 0
 
-    for event in event_sequence:
-        if event.type == 'time_shift':
-            timeline += ((event.value+1) / 100)
-        if event.type == 'velocity':
-            velocity = event.value * 4
-        else:
-            snote = SplitNote(event.type, timeline, event.value, velocity)
-            snote_seq.append(snote)
-    return snote_seq
+    # Get num_velocity_bins from codec
+    num_velocity_bins = vocabularies.num_velocity_bins_from_codec(codec)
 
+    for event in events:
+        # Add time shifts
+        time_delta = event.time - current_time
+        if time_delta > 0:
+            shift_steps = int(round(time_delta * codec.steps_per_second))
+            while shift_steps > 0:
+                shift_amount = min(shift_steps, codec.max_shift_steps)
+                tokens.append(
+                    codec.encode_event(vocabularies.Event("shift", shift_amount))
+                )
+                shift_steps -= shift_amount
 
-def _make_time_sift_events(prev_time, post_time):
-    time_interval = int(round((post_time - prev_time) * 100))
-    results = []
-    while time_interval >= RANGE_TIME_SHIFT:
-        results.append(Event(event_type='time_shift', value=RANGE_TIME_SHIFT-1))
-        time_interval -= RANGE_TIME_SHIFT
-    if time_interval == 0:
-        return results
-    else:
-        return results + [Event(event_type='time_shift', value=time_interval-1)]
-
-
-def _control_preprocess(ctrl_changes):
-    sustains = []
-
-    manager = None
-    for ctrl in ctrl_changes:
-        if ctrl.value >= 64 and manager is None:
-            # sustain down
-            manager = SustainDownManager(start=ctrl.time, end=None)
-        elif ctrl.value < 64 and manager is not None:
-            # sustain up
-            manager.end = ctrl.time
-            sustains.append(manager)
-            manager = None
-        elif ctrl.value < 64 and len(sustains) > 0:
-            sustains[-1].end = ctrl.time
-    return sustains
-
-
-def _note_preprocess(susteins, notes):
-    note_stream = []
-
-    for sustain in susteins:
-        for note_idx, note in enumerate(notes):
-            if note.start < sustain.start:
-                note_stream.append(note)
-            elif note.start > sustain.end:
-                notes = notes[note_idx:]
-                sustain.transposition_notes()
-                break
+        # Add event
+        if event.type == "note_on":
+            pitch, velocity, program, is_drum = event.value
+            if not is_drum:
+                tokens.append(
+                    codec.encode_event(vocabularies.Event("program", program))
+                )
+            velocity_bin = vocabularies.velocity_to_bin(velocity, num_velocity_bins)
+            tokens.append(
+                codec.encode_event(vocabularies.Event("velocity", velocity_bin))
+            )
+            if is_drum:
+                tokens.append(codec.encode_event(vocabularies.Event("drum", pitch)))
             else:
-                sustain.add_managed_note(note)
+                tokens.append(codec.encode_event(vocabularies.Event("pitch", pitch)))
+        elif event.type == "note_off":
+            pitch, program, is_drum = event.value
+            if not is_drum:
+                tokens.append(
+                    codec.encode_event(vocabularies.Event("program", program))
+                )
+            # Note: Legacy MT3 uses velocity=1 for note_off events
+            # Velocity must be in range [1, 127] (velocity 0 not allowed in new vocab)
+            tokens.append(codec.encode_event(vocabularies.Event("velocity", 1)))
+            if is_drum:
+                tokens.append(codec.encode_event(vocabularies.Event("drum", pitch)))
+            else:
+                tokens.append(codec.encode_event(vocabularies.Event("pitch", pitch)))
 
-    for sustain in susteins:
-        note_stream += sustain.managed_notes
+        current_time = event.time
 
-    note_stream.sort(key= lambda x: x.start)
-    return note_stream
+        while (
+            len(event_start_indices) < len(frame_times)
+            and frame_times[len(event_start_indices)] < current_time
+        ):
+            event_start_indices.append(token_idx)
+        token_idx = len(tokens)
 
+    event_end_indices = event_start_indices[1:] + [len(tokens)]
 
-def encode_midi(file_path):
-    notes = []
-    mid = pretty_midi.PrettyMIDI(midi_file=file_path)
-
-    for inst in mid.instruments:
-        inst_notes = inst.notes
-        # ctrl.number is the number of sustain control. If you want to know abour the number type of control,
-        # see https://www.midi.org/specifications-old/item/table-3-control-change-messages-data-bytes-2
-        ctrls = _control_preprocess([ctrl for ctrl in inst.control_changes if ctrl.number == 64])
-        notes += _note_preprocess(ctrls, inst_notes)
-
-    dnotes = _divide_note(notes)
-
-    # print(dnotes)
-    dnotes.sort(key=lambda x: x.time)
-    # print('sorted:')
-    # print(dnotes)
-    return dnotes
-    
-
-
-def decode_midi(idx_array, file_path=None):
-    event_sequence = [Event.from_int(idx) for idx in idx_array]
-    # print(event_sequence)
-    snote_seq = _event_seq2snote_seq(event_sequence)
-    note_seq = _merge_note(snote_seq)
-    note_seq.sort(key=lambda x:x.start)
-
-    mid = pretty_midi.PrettyMIDI()
-    # if want to change instument, see https://www.midi.org/specifications/item/gm-level-1-sound-set
-    instument = pretty_midi.Instrument(1, False, "Developed By Yang-Kichang")
-    instument.notes = note_seq
-
-    mid.instruments.append(instument)
-    if file_path is not None:
-        mid.write(file_path)
-    return mid
+    return tokens, event_start_indices, event_end_indices
 
 
-if __name__ == '__main__':
-    encoded = encode_midi('bin/ADIG04.mid')
-    print(encoded)
-    decided = decode_midi(encoded,file_path='bin/test.mid')
+@dataclasses.dataclass
+class NoteDecodingState:
+    """Decoding state for note transcription."""
 
-    ins = pretty_midi.PrettyMIDI('bin/ADIG04.mid')
-    print(ins)
-    print(ins.instruments[0])
-    for i in ins.instruments:
-        print(i.control_changes)
-        print(i.notes)
+    current_time: float = 0.0
+    current_velocity: int = 100
+    current_program: int = 0
+    active_pitches: MutableMapping[Tuple[int, int], Tuple[float, int]] = (
+        dataclasses.field(default_factory=dict)
+    )
+    tied_pitches: MutableMapping[Tuple[int, int], bool] = dataclasses.field(
+        default_factory=dict
+    )
+    is_tie_section: bool = False
+    note_sequence: note_seq.NoteSequence = dataclasses.field(
+        default_factory=lambda: note_seq.NoteSequence(ticks_per_quarter=220)
+    )
+
+
+def _add_note_to_sequence(
+    ns: note_seq.NoteSequence,
+    start_time: float,
+    end_time: float,
+    pitch: int,
+    velocity: int,
+    program: int,
+    is_drum: bool,
+):
+    """Helper function to add a note to a NoteSequence."""
+    end_time = max(end_time, start_time + 0.01)  # Ensure minimum duration
+    ns.notes.add(
+        start_time=start_time,
+        end_time=end_time,
+        pitch=pitch,
+        velocity=velocity,
+        program=program,
+        is_drum=is_drum,
+    )
+    ns.total_time = max(ns.total_time, end_time)
+
+
+def decode_note_event(
+    state: NoteDecodingState,
+    time: float,
+    event: vocabularies.Event,
+    codec: vocabularies.Codec,
+    num_velocity_bins: int,
+):
+    """Processes a single note event and updates the decoding state."""
+    if time < state.current_time:
+        raise ValueError(
+            f"Event time {time} is before current time {state.current_time}"
+        )
+
+    state.current_time = time
+
+    if event.type == "pitch":
+        pitch = event.value
+        program = state.current_program
+        if state.is_tie_section:
+            if (pitch, program) not in state.active_pitches:
+                raise ValueError(
+                    f"Inactive pitch/program in tie section: {pitch}/{program}"
+                )
+            if (pitch, program) in state.tied_pitches:
+                raise ValueError(f"Pitch/program is already tied: {pitch}/{program}")
+            state.tied_pitches[(pitch, program)] = True
+        elif state.current_velocity == 0:
+            # Note off
+            if (pitch, program) in state.active_pitches:
+                start_time, velocity = state.active_pitches.pop((pitch, program))
+                _add_note_to_sequence(
+                    state.note_sequence,
+                    start_time,
+                    time,
+                    pitch,
+                    velocity,
+                    program,
+                    False,
+                )
+        else:
+            # Note on
+            if (pitch, program) in state.active_pitches:
+                # End previous note
+                start_time, velocity = state.active_pitches.pop((pitch, program))
+                _add_note_to_sequence(
+                    state.note_sequence,
+                    start_time,
+                    time,
+                    pitch,
+                    velocity,
+                    program,
+                    False,
+                )
+            state.active_pitches[(pitch, program)] = (time, state.current_velocity)
+
+    elif event.type == "drum":
+        if state.current_velocity == 0:
+            raise ValueError("Velocity cannot be zero for a drum event")
+        _add_note_to_sequence(
+            state.note_sequence,
+            time,
+            time + 0.01,
+            event.value,
+            state.current_velocity,
+            0,
+            True,
+        )
+
+    elif event.type == "velocity":
+        state.current_velocity = vocabularies.bin_to_velocity(
+            event.value, num_velocity_bins
+        )
+
+    elif event.type == "program":
+        state.current_program = event.value
+
+    elif event.type == "tie":
+        if not state.is_tie_section:
+            raise ValueError("Tie event outside of a tie section")
+        for pitch, program in list(state.active_pitches.keys()):
+            if (pitch, program) not in state.tied_pitches:
+                start_time, velocity = state.active_pitches.pop((pitch, program))
+                _add_note_to_sequence(
+                    state.note_sequence,
+                    start_time,
+                    time,
+                    pitch,
+                    velocity,
+                    program,
+                    False,
+                )
+        state.is_tie_section = False
+
+    else:
+        raise ValueError(f"Unknown event type: {event.type}")
+
+
+def flush_note_decoding_state(state: NoteDecodingState) -> note_seq.NoteSequence:
+    """Ends all active notes and returns the resulting NoteSequence."""
+    for (pitch, program), (start_time, velocity) in state.active_pitches.items():
+        _add_note_to_sequence(
+            state.note_sequence,
+            start_time,
+            state.current_time,
+            pitch,
+            velocity,
+            program,
+            False,
+        )
+    return state.note_sequence
+
+
+def tokens_to_note_sequence(
+    tokens: List[int], codec: vocabularies.Codec
+) -> note_seq.NoteSequence:
+    """Converts a sequence of tokens to a NoteSequence."""
+    state = NoteDecodingState()
+    num_velocity_bins = vocabularies.num_velocity_bins_from_codec(codec)
+
+    # This is a simplified implementation of the decoding process.
+    # A proper implementation would need to handle segments and tie sections.
+    state.is_tie_section = False  # Start not in a tie section
+
+    for token in tokens:
+        event = codec.decode_event_index(token)
+        if event.type == "shift":
+            state.current_time += event.value / codec.steps_per_second
+        else:
+            decode_note_event(
+                state, state.current_time, event, codec, num_velocity_bins
+            )
+
+    return flush_note_decoding_state(state)
+
+
+def merge_events(event_lists: List[List[TimedEvent]]) -> List[TimedEvent]:
+    """Merges multiple event lists into a single sorted list."""
+    merged: List[TimedEvent] = []
+    for events in event_lists:
+        merged.extend(events)
+    merged.sort(key=lambda e: e.time)
+    return merged
