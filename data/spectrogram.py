@@ -13,7 +13,7 @@ from torch.autograd import Variable
 
 class STFT(torch.nn.Module):
     """adapted from Prem Seetharaman's https://github.com/pseeth/pytorch-stft"""
-
+    
     def __init__(self, filter_length, hop_length, win_length=None, window="hann"):
         super(STFT, self).__init__()
         if win_length is None:

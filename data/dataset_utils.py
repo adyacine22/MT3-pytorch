@@ -65,9 +65,16 @@ class FrameProcessingMixin:
         return frames
 
     def _pad_tokens(self, tokens):
-        """Pad or trim token sequence to EVENT_LENGTH."""
-        if len(tokens) < EVENT_LENGTH:
-            tokens = list(tokens) + [TOKEN_PAD] * (EVENT_LENGTH - len(tokens))
+        """Pad or trim token sequence to EVENT_LENGTH with torch tensors."""
+        if isinstance(tokens, torch.Tensor):
+            tokens_tensor = tokens.to(dtype=torch.long, device="cpu").flatten()
         else:
-            tokens = tokens[:EVENT_LENGTH]
-        return torch.LongTensor(tokens)
+            tokens_tensor = torch.as_tensor(tokens, dtype=torch.long, device="cpu").flatten()
+
+        current_len = tokens_tensor.numel()
+        if current_len >= EVENT_LENGTH:
+            return tokens_tensor[:EVENT_LENGTH].contiguous()
+
+        pad_len = EVENT_LENGTH - current_len
+        pad = torch.full((pad_len,), TOKEN_PAD, dtype=torch.long)
+        return torch.cat((tokens_tensor, pad), dim=0).contiguous()

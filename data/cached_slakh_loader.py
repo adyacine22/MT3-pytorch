@@ -13,7 +13,6 @@ Memory Management Strategies:
 
 import os
 import torch
-import numpy as np
 import random
 import psutil
 from pathlib import Path
@@ -24,6 +23,27 @@ from data.lru_cache import LRUCache
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+def _load_cached_pt(path):
+    return torch.load(path, map_location='cpu', weights_only=False)
+
+
+def _ensure_token_tensor(tokens) -> torch.Tensor:
+    if isinstance(tokens, torch.Tensor):
+        return tokens.to(dtype=torch.long, device="cpu").flatten()
+    return torch.as_tensor(tokens, dtype=torch.long, device="cpu").flatten()
+
+
+def _concat_token_list(token_seq) -> torch.Tensor:
+    if not token_seq:
+        return torch.empty(0, dtype=torch.long)
+    tensors = []
+    for token in token_seq:
+        tensors.append(_ensure_token_tensor(token))
+    if not tensors:
+        return torch.empty(0, dtype=torch.long)
+    return torch.cat(tensors, dim=0)
 
 from data.constants import (
     DEFAULT_NUM_MEL_BINS, DEFAULT_SAMPLE_RATE, FFT_SIZE,
@@ -196,17 +216,19 @@ class CachedSLAKHStemDataset(Dataset, FrameProcessingMixin):
                 try:
                     # Quick load to get stem count; we can't avoid reading a bit of each file
                     data = torch.load(cache_file, map_location='cpu', weights_only=False)
-                    num_stems = len(data['stems_audio'])
+                    if 'stems_audio' in data and data['stems_audio']:
+                        num_stems = len(data['stems_audio'])
+                    elif 'stem_frames' in data and data['stem_frames']:
+                        num_stems = len(data['stem_frames'])
+                    else:
+                        raise KeyError("Cached file missing stem data")
                     for stem_idx in range(num_stems):
                         self.stem_index.append((track_idx, stem_idx))
                 except Exception as e:
                     logger.warning(f"Could not index {cache_file}: {e}")
 
             # Create a process-local LRU for on-demand stem loads
-            def _loader(path):
-                return torch.load(path, map_location='cpu', weights_only=False)
-
-            self._file_cache = LRUCache(maxsize=cache_size, loader=_loader)
+            self._file_cache = LRUCache(maxsize=cache_size, loader=_load_cached_pt)
             logger.info("[SLAKH][%s] ✓ Indexed %d stems; will load on-demand from disk with LRU (size=%d)",
                         self.split, len(self.stem_index), cache_size)
 
@@ -223,25 +245,54 @@ class CachedSLAKHStemDataset(Dataset, FrameProcessingMixin):
             # Load file on-demand via per-process LRU cache
             data = self._file_cache.get(self.cache_files[track_idx])
         
-        audio = data['stems_audio'][stem_idx]
-        # Auto-convert fp16 to float32 if needed
-        if audio.dtype == torch.float16:
-            audio = audio.float()
-        
         tokens = data['stem_tokens'][stem_idx]
-        
-        # Select random chunk
-        audio_chunk = self._select_random_audio_chunk(audio)
-        
-        # Split to frames (hybrid approach)
-        frames = self._split_audio_to_frames(audio_chunk)
-        frames_padded = self._pad_frames(frames)
+
+        if 'stem_frames' in data:
+            frames_full = data['stem_frames'][stem_idx]
+            if not isinstance(frames_full, torch.Tensor):
+                frames_full = torch.tensor(frames_full)
+            if frames_full.dtype == torch.float16:
+                frames_full = frames_full.float()
+            total_frames = frames_full.shape[0]
+            if total_frames <= MEL_LENGTH:
+                frames_chunk = frames_full
+            else:
+                start_frame = random.randint(0, total_frames - MEL_LENGTH)
+                frames_chunk = frames_full[start_frame : start_frame + MEL_LENGTH]
+            frames_padded = self._pad_frames(frames_chunk)
+        else:
+            audio = data['stems_audio'][stem_idx]
+            if audio.dtype == torch.float16:
+                audio = audio.float()
+            audio_chunk = self._select_random_audio_chunk(audio)
+            frames = self._split_audio_to_frames(audio_chunk)
+            frames_padded = self._pad_frames(frames)
+
         tokens_padded = self._pad_tokens(tokens)
         
         return {
             "inputs": frames_padded,  # Frames, not mel-spectrograms
             "targets": tokens_padded,
         }
+    def warm_cache_for_workers(self):
+        if self.preload_all or not hasattr(self, "_file_cache"):
+            return
+        files_to_warm = self.cache_files[: self._file_cache.maxsize]
+        logger.info(
+            "[SLAKH][%s] Warming LRU cache with %d files before forking workers",
+            self.split,
+            len(files_to_warm),
+        )
+        for path in files_to_warm:
+            try:
+                self._file_cache.get(path)
+            except Exception as exc:  # pragma: no cover
+                logger.warning(
+                    "[SLAKH][%s] Warm cache failed for %s: %s",
+                    self.split,
+                    path,
+                    exc,
+                )
 
     def _select_random_audio_chunk(self, audio):
         """
@@ -326,8 +377,11 @@ class CachedSLAKHMixDataset(Dataset, FrameProcessingMixin):
                         self.split, len(self.cached_data))
         else:
             available_gb = get_available_memory_gb()
-            logger.info("[SLAKH-MIX][%s] Will load %d mix files on-demand (no caching). Available RAM: %.1f GB",
-                        self.split, num_files, available_gb)
+            logger.info("[SLAKH-MIX][%s] Using LRU cache (size=%d) for %d mix files. Available RAM: %.1f GB",
+                        self.split, cache_size, num_files, available_gb)
+            self._file_cache = LRUCache(maxsize=cache_size, loader=_load_cached_pt)
+            logger.info("[SLAKH-MIX][%s] ✓ Ready to load %d files with LRU cache (size=%d)",
+                        self.split, num_files, cache_size)
         
         self.melspectrogram = MelSpectrogram(
             DEFAULT_NUM_MEL_BINS,
@@ -346,30 +400,59 @@ class CachedSLAKHMixDataset(Dataset, FrameProcessingMixin):
         if self.preload_all:
             data = self.cached_data[idx]  # From preloaded memory
         else:
-            # Load file on-demand (no caching for mixes)
-            data = torch.load(self.cache_files[idx], map_location='cpu', weights_only=False)
+            data = self._file_cache.get(self.cache_files[idx])
         
-        audio = data['mix_audio']
-        # Auto-convert fp16 to float32 if needed
-        if audio.dtype == torch.float16:
-            audio = audio.float()
-        
-        # Merge all stem tokens (simple concatenation for now)
-        tokens = np.concatenate(data['stem_tokens'])
-        
-        # Select random chunk
-        audio_chunk = self._select_random_audio_chunk(audio)
-        
-        # Split to frames (hybrid approach)
-        frames = self._split_audio_to_frames(audio_chunk)
-        frames_padded = self._pad_frames(frames)
+        if 'mix_frames' in data:
+            frames_full = data['mix_frames']
+            if not isinstance(frames_full, torch.Tensor):
+                frames_full = torch.tensor(frames_full)
+            if frames_full.dtype == torch.float16:
+                frames_full = frames_full.float()
+            total_frames = frames_full.shape[0]
+            if total_frames <= MEL_LENGTH:
+                frames_chunk = frames_full
+            else:
+                start_frame = random.randint(0, total_frames - MEL_LENGTH)
+                frames_chunk = frames_full[start_frame : start_frame + MEL_LENGTH]
+            frames_padded = self._pad_frames(frames_chunk)
+            if 'mix_tokens' in data:
+                tokens = _ensure_token_tensor(data['mix_tokens'])
+            else:
+                tokens = _concat_token_list(data['stem_tokens'])
+        else:
+            audio = data['mix_audio']
+            if audio.dtype == torch.float16:
+                audio = audio.float()
+            tokens = _concat_token_list(data['stem_tokens'])
+            audio_chunk = self._select_random_audio_chunk(audio)
+            frames = self._split_audio_to_frames(audio_chunk)
+            frames_padded = self._pad_frames(frames)
+
         tokens_padded = self._pad_tokens(tokens)
         
         return {
             "inputs": frames_padded,  # Frames, not mel-spectrograms
             "targets": tokens_padded,
         }
-
+    def warm_cache_for_workers(self):
+        if self.preload_all or not hasattr(self, "_file_cache"):
+            return
+        files_to_warm = self.cache_files[: self._file_cache.maxsize]
+        logger.info(
+            "[SLAKH-MIX][%s] Warming LRU cache with %d files before forking workers",
+            self.split,
+            len(files_to_warm),
+        )
+        for path in files_to_warm:
+            try:
+                self._file_cache.get(path)
+            except Exception as exc:  # pragma: no cover
+                logger.warning(
+                    "[SLAKH-MIX][%s] Warm cache failed for %s: %s",
+                    self.split,
+                    path,
+                    exc,
+                )
     def _select_random_audio_chunk(self, audio):
         """
         Randomly select a chunk of audio for training.
@@ -388,14 +471,6 @@ class CachedSLAKHMixDataset(Dataset, FrameProcessingMixin):
         
         return audio[start_idx:end_idx]
 
-
-
-    def _pad_tokens(self, tokens):
-        if len(tokens) < EVENT_LENGTH:
-            tokens = list(tokens) + [TOKEN_PAD] * (EVENT_LENGTH - len(tokens))
-        else:
-            tokens = tokens[:EVENT_LENGTH]
-        return torch.LongTensor(tokens)
 
 
 class CachedSLAKHMixedDataset(Dataset, FrameProcessingMixin):
@@ -441,12 +516,7 @@ class CachedSLAKHMixedDataset(Dataset, FrameProcessingMixin):
             cache_size = cache_size or DEFAULT_CACHE_SIZE
             logger.info("[SLAKH-MIXED][%s] Using LRU cache (size=%d) for %d mixed files (large dataset)",
                         self.split, cache_size, num_files)
-            
-            @lru_cache(maxsize=cache_size)
-            def _load_cached_file(file_path):
-                return torch.load(file_path, map_location='cpu', weights_only=False)
-            
-            self._load_cached_file = _load_cached_file
+            self._file_cache = LRUCache(maxsize=cache_size, loader=_load_cached_pt)
             logger.info("[SLAKH-MIXED][%s] ✓ Ready to load %d files with LRU cache (size=%d)",
                         self.split, num_files, cache_size)
         
@@ -467,7 +537,7 @@ class CachedSLAKHMixedDataset(Dataset, FrameProcessingMixin):
         if self.preload_all:
             data = self.cached_data[idx]  # From preloaded memory
         else:
-            data = self._load_cached_file(self.cache_files[idx])  # From LRU cache
+            data = self._file_cache.get(self.cache_files[idx])  # From LRU cache
         
         stems_audio = data['stems_audio']
         stem_tokens = data['stem_tokens']
@@ -492,7 +562,7 @@ class CachedSLAKHMixedDataset(Dataset, FrameProcessingMixin):
             mixed_audio = mixed_audio / max_val
         
         # Merge tokens
-        tokens = np.concatenate([stem_tokens[i] for i in selected_indices])
+        tokens = _concat_token_list([stem_tokens[i] for i in selected_indices])
         
         # Select random chunk
         audio_chunk = self._select_random_audio_chunk(mixed_audio)
@@ -525,11 +595,3 @@ class CachedSLAKHMixedDataset(Dataset, FrameProcessingMixin):
         
         return audio[start_idx:end_idx]
 
-
-
-    def _pad_tokens(self, tokens):
-        if len(tokens) < EVENT_LENGTH:
-            tokens = list(tokens) + [TOKEN_PAD] * (EVENT_LENGTH - len(tokens))
-        else:
-            tokens = tokens[:EVENT_LENGTH]
-        return torch.LongTensor(tokens)

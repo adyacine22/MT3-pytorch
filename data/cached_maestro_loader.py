@@ -190,11 +190,21 @@ class CachedMaestroDataset(Dataset, FrameProcessingMixin):
                         num_files, available_gb, self.num_workers)
             logger.info("[MAESTRO] ✓ Ready to load %d files on-demand from disk", num_files)
             # Create a process-local LRU for on-demand loads so repeated hits are fast.
-            def _loader(path):
-                return torch.load(path, map_location='cpu', weights_only=False)
-
-            self._file_cache = LRUCache(maxsize=cache_size, loader=_loader)
+            self._file_cache = LRUCache(maxsize=cache_size, loader=_load_cached_pt)
             logger.info("[MAESTRO] LRU for on-demand loads initialized (size=%d)", cache_size)
+
+    def warm_cache_for_workers(self):
+        if self.preload_all:
+            return
+        if not hasattr(self, "_file_cache"):
+            return
+        files_to_warm = self.cache_files[: self._file_cache.maxsize]
+        logger.info("[MAESTRO] Warming LRU cache with %d files before forking workers", len(files_to_warm))
+        for path in files_to_warm:
+            try:
+                self._file_cache.get(path)
+            except Exception as exc:
+                logger.warning("[MAESTRO] Warm cache failed for %s: %s", path, exc)
 
     def __len__(self):
         return len(self.cached_data) if self.preload_all else len(self.cache_files)
@@ -207,33 +217,40 @@ class CachedMaestroDataset(Dataset, FrameProcessingMixin):
             # Load file on-demand via per-process LRU cache
             data = self._file_cache.get(self.cache_files[idx])
         
-        audio = data['audio']
-        # Auto-convert fp16 to float32 if needed
-        if audio.dtype == torch.float16:
-            audio = audio.float()
-        
         tokens = data['tokens']
-        
-        # Step 1: Select random audio chunk (256 frames = 32,768 samples)
-        audio_chunk, chunk_start_sample = self._select_random_audio_chunk(audio)
-        
-        # Step 2: Split audio chunk into frames (legacy MT3 approach)
-        # This matches: spectrograms.split_audio()
-        frames = self._split_audio_to_frames(audio_chunk)
-        
-        # Step 3: Extract tokens for this chunk + add TIE events
-        chunk_start_frame = chunk_start_sample // DEFAULT_HOP_WIDTH
+
+        if 'frames' in data:
+            frames_full = data['frames']
+            if not isinstance(frames_full, torch.Tensor):
+                frames_full = torch.tensor(frames_full)
+            # Ensure float32 for downstream operations
+            if frames_full.dtype == torch.float16:
+                frames_full = frames_full.float()
+            total_frames = frames_full.shape[0]
+            if total_frames <= MEL_LENGTH:
+                start_frame = 0
+                frames_chunk = frames_full
+            else:
+                start_frame = random.randint(0, total_frames - MEL_LENGTH)
+                frames_chunk = frames_full[start_frame : start_frame + MEL_LENGTH]
+            chunk_start_frame = start_frame
+            frames_padded = self._pad_frames(frames_chunk)
+        else:
+            audio = data['audio']
+            if audio.dtype == torch.float16:
+                audio = audio.float()
+            audio_chunk, chunk_start_sample = self._select_random_audio_chunk(audio)
+            frames = self._split_audio_to_frames(audio_chunk)
+            frames_padded = self._pad_frames(frames)
+            chunk_start_frame = chunk_start_sample // DEFAULT_HOP_WIDTH
+
         tokens_with_ties = self._extract_tokens_with_ties(
-            tokens, 
+            tokens,
             chunk_start_frame,
-            num_frames=MEL_LENGTH
+            num_frames=MEL_LENGTH,
         )
-        
-        # Step 4: Apply RLE to compress consecutive shifts
+
         tokens_rle = self._apply_rle_encoding(tokens_with_ties)
-        
-        # Step 5: Pad frames and tokens
-        frames_padded = self._pad_frames(frames)
         tokens_padded = self._pad_tokens(tokens_rle)
         
         # Return frames (NOT mel-spectrograms)
@@ -443,4 +460,5 @@ class CachedMaestroDataset(Dataset, FrameProcessingMixin):
         return compressed
     
     # Note: _split_audio_to_frames, _pad_frames, and _pad_tokens are inherited from FrameProcessingMixin
-
+def _load_cached_pt(path):
+    return torch.load(path, map_location='cpu', weights_only=False)

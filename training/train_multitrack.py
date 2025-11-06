@@ -11,6 +11,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
+import torch.multiprocessing as mp
 from torch.amp.autocast_mode import autocast
 from torch.amp.grad_scaler import GradScaler
 import random
@@ -50,6 +51,27 @@ logging.basicConfig(
     ],
 )
 logger = logging.getLogger(__name__)
+
+
+def _warm_dataset_cache(dataset, dataset_name, scope):
+    """Warm dataset caches in the main process so forked workers reuse memory via copy-on-write."""
+    warm_fn = getattr(dataset, "warm_cache_for_workers", None)
+    if not callable(warm_fn):
+        return
+    try:
+        logger.info(
+            "  Warming %s cache for %s dataset before forking workers...",
+            scope,
+            dataset_name,
+        )
+        warm_fn()
+    except Exception as exc:  # pragma: no cover
+        logger.warning(
+            "  ! Failed to warm %s cache for %s dataset: %s",
+            scope,
+            dataset_name,
+            exc,
+        )
 
 
 class ExponentialMovingAverage:
@@ -150,12 +172,15 @@ def setup_dataloaders(config):
 
     datasets = {}
     val_datasets = {}
-    
+    num_workers_cfg = max(0, int(config.get("num_workers", 0)))
+    dataset_timings: dict[str, float] = {}
+
     use_cached = config.get("use_cached_data", False)
     
     # MAESTRO dataset (piano)
     if config.get("use_maestro", True):
         logger.info("  Loading MAESTRO dataset...")
+        maestro_train_start = time.perf_counter()
         
         if use_cached:
             # Use cached dataset
@@ -165,20 +190,20 @@ def setup_dataloaders(config):
             cache_size = config.get("cache_size")
             # Use None to allow dataset auto-detection; config can set True/False explicitly
             preload_all = config.get("preload_all", None)
-            num_workers = config.get("num_workers", 0)  # Get num_workers for cache sizing
             
             maestro_dataset = CachedMaestroDataset(
                 cache_dir=maestro_cache_dir,
                 max_tracks=maestro_max_samples,
                 cache_size=cache_size,
                 preload_all=preload_all,
-                num_workers=max(1, num_workers)  # Pass to dataset for RAM allocation
+                num_workers=max(1, num_workers_cfg)  # Pass to dataset for RAM allocation
             )
             datasets["maestro"] = maestro_dataset
             logger.info(f"  ✓ MAESTRO train: {len(datasets['maestro'])} samples (cached)")
             
             # Validation
             if maestro_val_cache_dir:
+                maestro_val_start = time.perf_counter()
                 val_max = config.get("val_max_samples", 100)
                 # Validation datasets are small; avoid auto-preloading by default.
                 # Allow explicit override via config key `preload_all_val` (default False).
@@ -191,6 +216,7 @@ def setup_dataloaders(config):
                 )
                 val_datasets["maestro"] = maestro_val_dataset
                 logger.info(f"  ✓ MAESTRO val: {len(val_datasets['maestro'])} samples (cached)")
+                dataset_timings["maestro_val_s"] = time.perf_counter() - maestro_val_start
         else:
             # Use raw dataset
             try:
@@ -208,10 +234,13 @@ def setup_dataloaders(config):
                 logger.info(f"  ✓ MAESTRO: {len(datasets['maestro'])} samples")
             except Exception as e:
                 logger.warning(f"Could not load MAESTRO: {e}")
+        dataset_timings["maestro_train_s"] = time.perf_counter() - maestro_train_start
 
     # SLAKH Stem Dataset (individual instruments)
     if config.get("use_slakh_stems", True):
         logger.info("  Loading SLAKH stems dataset...")
+        slakh_stems_train_start = time.perf_counter()
+        slakh_stems_val_start = None
         try:
             if use_cached:
                 slakh_cache_dir = config.get("slakh_cache_dir")
@@ -219,20 +248,20 @@ def setup_dataloaders(config):
                 slakh_max_tracks = config.get("slakh_max_tracks")
                 cache_size = config.get("cache_size")
                 preload_all = config.get("preload_all", None)
-                num_workers = config.get("num_workers", 0)
                 
                 slakh_stems = CachedSLAKHStemDataset(
                     cache_dir=slakh_cache_dir,
                     max_tracks=slakh_max_tracks,
                     cache_size=cache_size,
                     preload_all=preload_all,
-                    num_workers=max(1, num_workers)
+                    num_workers=max(1, num_workers_cfg)
                 )
                 datasets["slakh_stems"] = slakh_stems
                 logger.info(f"  ✓ SLAKH stems train: {len(datasets['slakh_stems'])} samples (cached)")
                 
                 # Validation
                 if slakh_val_cache_dir:
+                    slakh_stems_val_start = time.perf_counter()
                     val_max = config.get("val_max_samples", 100)
                     slakh_val_stems = CachedSLAKHStemDataset(
                         cache_dir=slakh_val_cache_dir,
@@ -251,10 +280,15 @@ def setup_dataloaders(config):
                 logger.info(f"  ✓ SLAKH stems: {len(datasets['slakh_stems'])} samples")
         except Exception as e:
             logger.warning(f"Could not load SLAKH stems: {e}")
+        dataset_timings["slakh_stems_train_s"] = time.perf_counter() - slakh_stems_train_start
+        if slakh_stems_val_start is not None and "slakh_stems" in val_datasets:
+            dataset_timings["slakh_stems_val_s"] = time.perf_counter() - slakh_stems_val_start
 
     # SLAKH Mix Dataset (full tracks with all instruments)
     if config.get("use_slakh_mix", False):
         logger.info("  Loading SLAKH mix dataset...")
+        slakh_mix_train_start = time.perf_counter()
+        slakh_mix_val_start = None
         try:
             if use_cached:
                 slakh_cache_dir = config.get("slakh_cache_dir")
@@ -262,19 +296,19 @@ def setup_dataloaders(config):
                 slakh_max_tracks = config.get("slakh_max_tracks")
                 cache_size = config.get("cache_size")
                 preload_all = config.get("preload_all", None)
-                num_workers = config.get("num_workers", 0)
                 
                 slakh_mix = CachedSLAKHMixDataset(
                     cache_dir=slakh_cache_dir,
                     max_tracks=slakh_max_tracks,
                     cache_size=cache_size,
                     preload_all=preload_all,
-                    num_workers=max(1, num_workers)
+                    num_workers=max(1, num_workers_cfg)
                 )
                 datasets["slakh_mix"] = slakh_mix
                 logger.info(f"  ✓ SLAKH mix train: {len(datasets['slakh_mix'])} samples (cached)")
                 # Validation
                 if slakh_val_cache_dir:
+                    slakh_mix_val_start = time.perf_counter()
                     val_max = config.get("val_max_samples", 100)
                     slakh_val_mix = CachedSLAKHMixDataset(
                         cache_dir=slakh_val_cache_dir,
@@ -293,10 +327,15 @@ def setup_dataloaders(config):
                 logger.info(f"  ✓ SLAKH mix: {len(datasets['slakh_mix'])} samples")
         except Exception as e:
             logger.warning(f"Could not load SLAKH mix: {e}")
+        dataset_timings["slakh_mix_train_s"] = time.perf_counter() - slakh_mix_train_start
+        if slakh_mix_val_start is not None and "slakh_mix" in val_datasets:
+            dataset_timings["slakh_mix_val_s"] = time.perf_counter() - slakh_mix_val_start
 
     # SLAKH Mixed Dataset (random stem combinations)
     if config.get("use_slakh_mixed", False):
         logger.info("  Loading SLAKH mixed dataset...")
+        slakh_mixed_train_start = time.perf_counter()
+        slakh_mixed_val_start = None
         try:
             if use_cached:
                 slakh_cache_dir = config.get("slakh_cache_dir")
@@ -316,6 +355,7 @@ def setup_dataloaders(config):
                 
                 # Validation
                 if slakh_val_cache_dir:
+                    slakh_mixed_val_start = time.perf_counter()
                     val_max = config.get("val_max_samples", 100)
                     slakh_val_mixed = CachedSLAKHMixedDataset(
                         cache_dir=slakh_val_cache_dir,
@@ -336,9 +376,27 @@ def setup_dataloaders(config):
                 logger.info(f"  ✓ SLAKH mixed: {len(datasets['slakh_mixed'])} samples")
         except Exception as e:
             logger.warning(f"Could not load SLAKH mixed: {e}")
+        dataset_timings["slakh_mixed_train_s"] = time.perf_counter() - slakh_mixed_train_start
+        if slakh_mixed_val_start is not None and "slakh_mixed" in val_datasets:
+            dataset_timings["slakh_mixed_val_s"] = time.perf_counter() - slakh_mixed_val_start
 
     if not datasets:
         raise ValueError("No datasets loaded successfully!")
+
+    if num_workers_cfg > 0:
+        logger.info("\n  Warming dataset caches in main process for copy-on-write reuse...")
+        warm_start = time.perf_counter()
+        for name, dataset_obj in datasets.items():
+            _warm_dataset_cache(dataset_obj, name, scope="train")
+        for name, dataset_obj in val_datasets.items():
+            _warm_dataset_cache(dataset_obj, name, scope="validation")
+        dataset_timings["warm_caches_s"] = time.perf_counter() - warm_start
+
+    if dataset_timings:
+        timing_summary = ", ".join(
+            f"{key}={value:.2f}" for key, value in sorted(dataset_timings.items())
+        )
+        logger.info("\n  Dataset timing summary (s): %s", timing_summary)
 
     # Create multi-task dataset with temperature sampling
     logger.info("\n  Creating multi-task dataset...")
@@ -373,11 +431,18 @@ def setup_dataloaders(config):
         logger.warning("  ! No validation datasets loaded")
 
     # Create dataloaders
-    num_workers = config.get("num_workers", 0)
+    num_workers = num_workers_cfg
     pin_memory = config.get("pin_memory", True)
     prefetch_factor = config.get("prefetch_factor", 2) if num_workers > 0 else None
     persistent_workers = config.get("persistent_workers", False) and num_workers > 0
     
+    mp_context = None
+    if num_workers > 0:
+        try:
+            mp_context = mp.get_context("fork")
+        except RuntimeError:
+            mp_context = None
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=config.get("batch_size", 4),
@@ -387,6 +452,7 @@ def setup_dataloaders(config):
         prefetch_factor=prefetch_factor,
         collate_fn=collate_fn,
         persistent_workers=persistent_workers,
+        multiprocessing_context=mp_context,
     )
 
     val_loader = None
@@ -400,6 +466,7 @@ def setup_dataloaders(config):
             prefetch_factor=prefetch_factor,
             collate_fn=collate_fn,
             persistent_workers=persistent_workers,
+            multiprocessing_context=mp_context,
         )
 
     return train_loader, val_loader
@@ -826,15 +893,13 @@ def main(config_name="A100_pretraining_test"):
     total_params = count_parameters(model)
     logger.info(f"  Total parameters: {total_params:,}")
     
-    # Initialize EMA (Exponential Moving Average) for more stable inference
+    # EMA configuration -- defer actual initialization until AFTER torch.compile()
+    # because torch.compile() may wrap/replace the model object and change
+    # parameter name views; creating EMA before compilation can lead to
+    # mismatched parameter name sets and assertion failures in update().
     use_ema = config.get("use_ema", True)
     ema_decay = config.get("ema_decay", 0.9999)
-    if use_ema:
-        ema = ExponentialMovingAverage(model, decay=ema_decay)
-        logger.info(f"  ✓ EMA initialized (decay={ema_decay})")
-    else:
-        ema = None
-        logger.info("  EMA disabled")
+    ema = None
 
     # Apply torch.compile() for faster execution (PyTorch 2.0+)
     use_torch_compile = config.get("use_torch_compile", False)
@@ -850,6 +915,18 @@ def main(config_name="A100_pretraining_test"):
             logger.info("  Continuing without compilation")
     elif use_torch_compile:
         logger.warning("  torch.compile() requested but not available (requires PyTorch 2.0+)")
+
+    # Initialize EMA after potential compilation so parameter names match
+    # the runtime model object used during training.
+    if use_ema:
+        try:
+            ema = ExponentialMovingAverage(model, decay=ema_decay)
+            logger.info(f"  ✓ EMA initialized (decay={ema_decay})")
+        except Exception as e:
+            logger.warning(f"  Warning: EMA initialization failed: {e}")
+            ema = None
+    else:
+        logger.info("  EMA disabled")
 
     # Setup datasets and loaders
     train_loader, val_loader = setup_dataloaders(config)

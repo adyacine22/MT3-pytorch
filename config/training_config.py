@@ -14,11 +14,11 @@ LOG_DIR = PROJECT_ROOT / "test_outputs"
 CHECKPOINT_DIR.mkdir(exist_ok=True, parents=True)
 LOG_DIR.mkdir(exist_ok=True, parents=True)
 
-# Cache directories
-MAESTRO_CACHE_TRAIN = PROJECT_ROOT / "cache" / "maestro" / "train"
-MAESTRO_CACHE_VAL = PROJECT_ROOT / "cache" / "maestro" / "validation"
-SLAKH_CACHE_TRAIN = PROJECT_ROOT / "cache" / "slakh" / "train"
-SLAKH_CACHE_VAL = PROJECT_ROOT / "cache" / "slakh" / "validation"
+# Cache directories (optimized layout by default)
+MAESTRO_CACHE_TRAIN = PROJECT_ROOT / "cache" / "maestro_opt_fp16" / "train"
+MAESTRO_CACHE_VAL = PROJECT_ROOT / "cache" / "maestro_opt_fp16" / "validation"
+SLAKH_CACHE_TRAIN = PROJECT_ROOT / "cache" / "slakh_opt_fp16" / "train"
+SLAKH_CACHE_VAL = PROJECT_ROOT / "cache" / "slakh_opt_fp16" / "validation"
 
 
 # ==============================================================================
@@ -31,7 +31,7 @@ A100_PRETRAINING_FULL = {
     "config_name": "A100_pretraining_full",
     
     # Dataset configuration - use cached datasets
-    "use_cached_data": True,
+    "use_cached_data": False,
     "maestro_cache_dir": str(MAESTRO_CACHE_TRAIN),
     "maestro_val_cache_dir": str(MAESTRO_CACHE_VAL),
     "slakh_cache_dir": str(SLAKH_CACHE_TRAIN),
@@ -45,7 +45,7 @@ A100_PRETRAINING_FULL = {
     
     # Memory management for large datasets
     "cache_size": 400,  # LRU cache size - reduced to fit 200GB host RAM targets
-    "preload_all": False,  # Keep LRU/on-demand for very large full pretraining
+    "preload_all": True,  # Keep LRU/on-demand for very large full pretraining
     # Validation-specific preload override (default: do NOT preload validation)
     "preload_all_val": False,
     
@@ -59,6 +59,7 @@ A100_PRETRAINING_FULL = {
         "maestro": 3.0,
         "slakh_stems": 3.0,
         "slakh_mix": 3.0,
+        "slakh_mixed": 3.0,
     },
     
     # Training hyperparameters (matching legacy MT3)
@@ -114,15 +115,15 @@ A100_PRETRAINING_TEST = {
     "use_maestro": True,
     "use_slakh_stems": True,
     "use_slakh_mix": True,
-    "use_slakh_mixed": False,
-    "maestro_max_samples": 800,  # Increased sample size for stronger cache impact tests
-    "slakh_max_tracks": 400,  # Increased track count to exercise larger caches
+    "use_slakh_mixed": True,
+    "maestro_max_samples": 100,  # Increased sample size for stronger cache impact tests
+    "slakh_max_tracks": 100,  # Increased track count to exercise larger caches
     
     # Memory management (moderate dataset)
-    "cache_size": 400,  # Fixed conservative size - prevents RAM issues with workers
-    "preload_all": True,  # Preload for test runs to benefit from COW sharing
+    "cache_size": 200,  # Used only when cached datasets are enabled
+    "preload_all": True,
     # Validation-specific preload override (default: do NOT preload validation)
-    "preload_all_val": False,
+    "preload_all_val": True,
     
     # Audio mixing
     "use_audio_mixing": False,
@@ -134,15 +135,17 @@ A100_PRETRAINING_TEST = {
         "maestro": 3.0,
         "slakh_stems": 3.0,
         "slakh_mix": 3.0,
+        "slakh_mixed": 3.0,
     },
     
+    
     # Training hyperparameters (same as full but fewer steps)
-    "batch_size": 128,
-    "gradient_accumulation_steps": 4,  # Effective batch = 512
-    "max_steps": 100,  # Quick test - reduced from 500
+    "batch_size": 256,
+    "gradient_accumulation_steps": 4,  # Effective batch = 1024
+    "max_steps": 10,  # Quick test - reduced from 500
     "log_interval": 5,  # Log more frequently for testing
-    "val_interval": 50,
-    "save_interval": 200,
+    "val_interval": 20,
+    "save_interval": 100,
     
     # Optimizer
     "learning_rate": 1e-4,
@@ -156,16 +159,16 @@ A100_PRETRAINING_TEST = {
     # A100 optimizations
     "use_mixed_precision": True,
     "use_fused_optimizer": True,
-    "use_torch_compile": False,
+    "use_torch_compile": True,
     
     # Data loading (reduced for small test dataset)
-    "num_workers": 24,
+    "num_workers": 0,
     "pin_memory": True,
     "prefetch_factor": 4,  # Lower prefetch to reduce per-worker queue memory
     "persistent_workers": True,  # Keep workers alive to avoid reinitialization
     
     # Validation
-    "val_max_samples": None,
+    "val_max_samples": 20,
     
     # Checkpointing
     "checkpoint_dir": str(CHECKPOINT_DIR),
@@ -186,7 +189,7 @@ A100_FINETUNING_FULL = {
     "use_maestro": True,
     "use_slakh_stems": True,
     "use_slakh_mix": True,
-    "use_slakh_mixed": False,
+    "use_slakh_mixed": True,
     "maestro_max_samples": None,
     "slakh_max_tracks": None,
     

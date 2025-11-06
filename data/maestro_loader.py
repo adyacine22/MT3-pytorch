@@ -28,10 +28,23 @@ from data.constants import (
 from data.spectrogram import MelSpectrogram
 from config.data_config import data_config
 import note_seq
+from typing import Optional, Dict, Any
+from data.lru_cache import LRUCache
+
+
+_DEFAULT_RAW_CACHE_SIZE = 200
 
 
 class MIDIDataset(IterableDataset):
-    def __init__(self, root_dir=None, dataset_file="maestro-v3.0.0.json", split="train"):
+    def __init__(
+        self,
+        root_dir=None,
+        dataset_file="maestro-v3.0.0.json",
+        split="train",
+        cache_size: Optional[int] = _DEFAULT_RAW_CACHE_SIZE,
+        preload_all: bool = False,
+        num_workers: int = 1,
+    ):
         """
         Initialize the MIDI dataset for MAESTRO v3.0.0.
 
@@ -39,12 +52,18 @@ class MIDIDataset(IterableDataset):
             root_dir: Root directory containing the MAESTRO dataset (defaults to data_config.maestro_root)
             dataset_file: JSON file containing dataset metadata
             split: Dataset split ('train', 'validation', 'test')
+            cache_size: Number of tracks to keep hot in LRU cache (None to disable)
+            preload_all: If True, load all tracks into memory during initialization
+            num_workers: DataLoader worker count (for logging/estimation)
         """
         # Use config path if not provided
         self.root_dir = root_dir if root_dir is not None else data_config.maestro_root
         self.split = split
         self.type = split  # For compatibility with _preprocess method
         self.config = data_config  # Store config reference
+        self.num_workers = max(1, num_workers)
+        self.preload_all = bool(preload_all)
+        self.cache_size = int(cache_size) if cache_size else None
 
         # Load dataset metadata (MAESTRO v3 uses columnar format)
         json_path = os.path.join(self.root_dir, dataset_file)
@@ -76,6 +95,20 @@ class MIDIDataset(IterableDataset):
             mel_fmin=MEL_FMIN,
             mel_fmax=MEL_FMAX,
         )
+
+        self._track_indices = list(range(len(self.midi_paths)))
+        self._track_cache: Optional[LRUCache] = None
+        self._preloaded_tracks: Optional[list[Optional[Dict[str, Any]]]] = None
+        if self.preload_all:
+            self._preloaded_tracks = []
+            for idx in self._track_indices:
+                try:
+                    self._preloaded_tracks.append(self._load_track_data(idx))
+                except Exception as exc:
+                    print(f"[MAESTRO][{self.split}] Failed to preload index {idx}: {exc}")
+                    self._preloaded_tracks.append(None)
+        elif self.cache_size:
+            self._track_cache = LRUCache(maxsize=self.cache_size, loader=self._load_track_data)
 
     def _load_audio(self, audio_path, sample_rate):
         """Load and normalize audio to [-1, 1] range (legacy MT3 behavior)."""
@@ -128,6 +161,42 @@ class MIDIDataset(IterableDataset):
 
         # Convert events to tokens (we'll need frame_times, so return both ns and events)
         return ns, events
+
+    def _load_track_data(self, idx: int) -> Dict[str, Any]:
+        midi_path = str(self.midi_paths[idx])
+        audio_path = str(self.audio_paths[idx])
+        audio = self._load_audio(audio_path=audio_path, sample_rate=DEFAULT_SAMPLE_RATE)
+        note_seq_obj, events = self._tokenize(str(midi_path))
+        return {
+            "audio": audio,
+            "note_sequence": note_seq_obj,
+            "events": events,
+            "midi_path": midi_path,
+            "audio_path": audio_path,
+        }
+
+    def _get_track(self, idx: int) -> Dict[str, Any]:
+        if self.preload_all:
+            if self._preloaded_tracks is None:
+                raise RuntimeError("Preloaded tracks missing")
+            data = self._preloaded_tracks[idx]
+            if data is None:
+                raise FileNotFoundError(f"Preloaded data missing for index {idx}")
+            return data
+        if self._track_cache is not None:
+            return self._track_cache.get(idx)
+        return self._load_track_data(idx)
+
+    def warm_cache_for_workers(self):
+        if self.preload_all or self._track_cache is None:
+            return
+        indices = self._track_indices[: self._track_cache.maxsize]
+        print(f"[MAESTRO][{self.split}] Warming raw cache with {len(indices)} tracks before forking workers")
+        for idx in indices:
+            try:
+                self._track_cache.get(idx)
+            except Exception as exc:
+                print(f"[MAESTRO][{self.split}] Warning: failed to warm track {idx}: {exc}")
 
     def _get_random_length_segment(self, row):
         new_row = {}
@@ -279,11 +348,16 @@ class MIDIDataset(IterableDataset):
 
     def _preprocess(self):
         for idx in range(len(self.midi_paths)):
-            midi_path = str(self.midi_paths[idx])
-            audio_path = str(self.audio_paths[idx])
-            audio = self._load_audio(audio_path=audio_path, sample_rate=DEFAULT_SAMPLE_RATE)
+            try:
+                track = self._get_track(idx)
+            except Exception as exc:
+                print(f"[MAESTRO][{self.split}] Warning: skipping track {idx}: {exc}")
+                continue
+
+            audio = track["audio"]
             frames, frame_times = self._audio_to_frames(audio)
-            encoded_midi = self._tokenize(str(midi_path))
+            encoded_midi = (track["note_sequence"], track["events"])
+            midi_path = track["midi_path"]
 
             row = {
                 "inputs": frames,

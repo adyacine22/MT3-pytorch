@@ -27,6 +27,17 @@ from data.constants import (
 from data.spectrogram import MelSpectrogram
 from config.data_config import data_config
 import note_seq
+from typing import Dict, Tuple, Optional
+from data.lru_cache import LRUCache
+
+
+_METADATA_CACHE: Dict[str, Dict[str, dict]] = {}
+_DEFAULT_RAW_CACHE_SIZE = 200
+
+
+def _clear_metadata_cache():
+    """Utility for tests to clear cached metadata."""
+    _METADATA_CACHE.clear()
 
 
 def parse_slakh_metadata(track_dir):
@@ -38,9 +49,14 @@ def parse_slakh_metadata(track_dir):
     Returns:
         dict: Stem information with keys like 'S00', 'S01', etc.
     """
+    cached = _METADATA_CACHE.get(track_dir)
+    if cached is not None:
+        return cached
+
     metadata_path = os.path.join(track_dir, "metadata.yaml")
     if not os.path.exists(metadata_path):
-        return {}
+        _METADATA_CACHE[track_dir] = {}
+        return _METADATA_CACHE[track_dir]
 
     with open(metadata_path, "r") as f:
         metadata = yaml.safe_load(f)
@@ -54,6 +70,8 @@ def parse_slakh_metadata(track_dir):
                 "name": info.get("inst_class", "Unknown"),
                 "midi_program_name": info.get("midi_program_name", "Unknown"),
             }
+
+    _METADATA_CACHE[track_dir] = stems
     return stems
 
 
@@ -447,7 +465,15 @@ class SLAKHDataset(IterableDataset):
 class SLAKHStemDataset(Dataset):
     """Load individual SLAKH stems (one instrument per sample)."""
 
-    def __init__(self, root_dir=None, split="train", max_tracks=None):
+    def __init__(
+        self,
+        root_dir=None,
+        split="train",
+        max_tracks=None,
+        cache_size: Optional[int] = _DEFAULT_RAW_CACHE_SIZE,
+        preload_all: bool = False,
+        num_workers: int = 1,
+    ):
         """
         Initialize the SLAKH stem dataset.
 
@@ -455,6 +481,9 @@ class SLAKHStemDataset(Dataset):
             root_dir: Root directory for SLAKH split
             split: Dataset split ('train', 'validation', 'test')
             max_tracks: Maximum number of tracks to load
+            cache_size: Number of stems to keep hot in an LRU cache (None to disable)
+            preload_all: If True, load every stem into memory up front
+            num_workers: DataLoader worker count (for logging/estimation only)
         """
         # Use config path if not provided
         if root_dir is None:
@@ -471,6 +500,9 @@ class SLAKHStemDataset(Dataset):
 
         self.split = split
         self.config = data_config
+        self.num_workers = max(1, num_workers)
+        self.preload_all = bool(preload_all)
+        self.cache_size = int(cache_size) if cache_size else None
 
         # Create MelSpectrogram object once (reused for all samples)
         self.melspectrogram = MelSpectrogram(
@@ -482,42 +514,93 @@ class SLAKHStemDataset(Dataset):
             mel_fmax=MEL_FMAX,
         )
 
-        # Find all track directories
+        # Discover track directories
         track_dirs = sorted(Path(self.root_dir).glob("Track*"))
-
         if max_tracks is not None:
             track_dirs = track_dirs[:max_tracks]
 
         self.track_paths = [str(d) for d in track_dirs]
+        self.metadata: Dict[str, Dict[str, dict]] = {}
         self.stem_index = self._build_stem_index()  # List of (track, stem_id)
 
+        self._stem_cache = None
+        self._preloaded_stems = None
+
+        if self.preload_all:
+            self._preloaded_stems = []
+            for key in self.stem_index:
+                try:
+                    self._preloaded_stems.append(self._load_stem_data(key))
+                except Exception as exc:
+                    # Skip invalid stems gracefully
+                    print(f"[SLAKH][{self.split}] Failed to preload {key}: {exc}")
+                    self._preloaded_stems.append(None)
+        elif self.cache_size:
+            self._stem_cache = LRUCache(maxsize=self.cache_size, loader=self._load_stem_data)
+
     def _build_stem_index(self):
-        """Create flat list of all stems across all tracks."""
+        """Create flat list of all stems across all tracks (with cached metadata)."""
         index = []
         for track_dir in self.track_paths:
             stems = parse_slakh_metadata(track_dir)
+            self.metadata[track_dir] = stems
             for stem_id in stems.keys():
                 index.append((track_dir, stem_id))
         return index
 
+    def _load_stem_data(self, key: Tuple[str, str]):
+        """Loader used by the LRU cache / preloader."""
+        track_dir, stem_id = key
+        stems = self.metadata.get(track_dir)
+        if stems is None:
+            stems = parse_slakh_metadata(track_dir)
+            self.metadata[track_dir] = stems
+
+        stem_info = stems.get(stem_id)
+        if stem_info is None:
+            raise KeyError(f"Stem {stem_id} missing for {track_dir}")
+
+        result = load_stem(track_dir, stem_id, stem_info)
+        if result is None:
+            raise FileNotFoundError(f"Could not load stem {stem_id} from {track_dir}")
+        return result
+
+    def warm_cache_for_workers(self):
+        """Populate the LRU cache before forking DataLoader workers."""
+        if self.preload_all or self._stem_cache is None:
+            return
+        keys_to_warm = self.stem_index[: self._stem_cache.maxsize]
+        print(f"[SLAKH][{self.split}] Warming raw stem cache with {len(keys_to_warm)} entries")
+        for key in keys_to_warm:
+            try:
+                self._stem_cache.get(key)
+            except Exception as exc:  # pragma: no cover - defensive
+                print(f"[SLAKH][{self.split}] Warning: failed to warm {key}: {exc}")
+
+    def _get_stem(self, idx: int):
+        key = self.stem_index[idx]
+        if self.preload_all:
+            data = self._preloaded_stems[idx]
+            if data is None:
+                raise FileNotFoundError(f"Preloaded data missing for {key}")
+            return data
+        if self._stem_cache is not None:
+            return self._stem_cache.get(key)
+        return self._load_stem_data(key)
+
     def __getitem__(self, idx):
         """Get a single stem sample."""
-        track_dir, stem_id = self.stem_index[idx]
-        stems = parse_slakh_metadata(track_dir)
-
-        # Load stem
-        result = load_stem(track_dir, stem_id, stems[stem_id])
-        if result is None:
+        try:
+            audio, note_seq_obj = self._get_stem(idx)
+        except Exception:
             # Skip to next valid sample if this one fails
             return self.__getitem__((idx + 1) % len(self))
-
-        audio, note_seq = result
 
         # Convert audio to mel spectrogram
         mel = self._compute_mel_spectrogram(audio)
 
         # Convert note sequence to tokens
-        events = note_sequence_to_timed_events(note_seq)
+        events = note_sequence_to_timed_events(note_seq_obj)
 
         # Create frame times for tokenization
         num_frames = mel.shape[0]
@@ -570,7 +653,15 @@ class SLAKHStemDataset(Dataset):
 class SLAKHMixDataset(Dataset):
     """Load full SLAKH mixes (all instruments per sample)."""
 
-    def __init__(self, root_dir=None, split="train", max_tracks=None):
+    def __init__(
+        self,
+        root_dir=None,
+        split="train",
+        max_tracks=None,
+        cache_size: Optional[int] = _DEFAULT_RAW_CACHE_SIZE,
+        preload_all: bool = False,
+        num_workers: int = 1,
+    ):
         """
         Initialize the SLAKH mix dataset.
 
@@ -578,6 +669,9 @@ class SLAKHMixDataset(Dataset):
             root_dir: Root directory for SLAKH split
             split: Dataset split ('train', 'validation', 'test')
             max_tracks: Maximum number of tracks to load
+            cache_size: Number of tracks to keep hot in an LRU cache (None to disable)
+            preload_all: If True, load every track into memory up front
+            num_workers: DataLoader worker count (for logging only)
         """
         # Use config path if not provided
         if root_dir is None:
@@ -594,6 +688,9 @@ class SLAKHMixDataset(Dataset):
 
         self.split = split
         self.config = data_config
+        self.num_workers = max(1, num_workers)
+        self.preload_all = bool(preload_all)
+        self.cache_size = int(cache_size) if cache_size else None
 
         # Find all track directories
         track_dirs = sorted(Path(self.root_dir).glob("Track*"))
@@ -602,6 +699,9 @@ class SLAKHMixDataset(Dataset):
             track_dirs = track_dirs[:max_tracks]
 
         self.track_paths = [str(d) for d in track_dirs]
+        self.metadata: Dict[str, Dict[str, dict]] = {
+            track: parse_slakh_metadata(track) for track in self.track_paths
+        }
 
         # Create MelSpectrogram once for efficiency (reused across all samples)
         self.melspectrogram = MelSpectrogram(
@@ -613,33 +713,72 @@ class SLAKHMixDataset(Dataset):
             mel_fmax=MEL_FMAX,
         )
 
-    def __getitem__(self, idx):
-        """Get a full mix sample."""
-        track_dir = self.track_paths[idx]
-        stems = parse_slakh_metadata(track_dir)
+        self._track_cache = None
+        self._preloaded_tracks = None
+        if self.preload_all:
+            self._preloaded_tracks = []
+            for track_dir in self.track_paths:
+                try:
+                    self._preloaded_tracks.append(self._load_mix_data(track_dir))
+                except Exception as exc:
+                    print(f"[SLAKH-MIX][{self.split}] Failed to preload {track_dir}: {exc}")
+                    self._preloaded_tracks.append(None)
+        elif self.cache_size:
+            self._track_cache = LRUCache(maxsize=self.cache_size, loader=self._load_mix_data)
 
-        # Load all stems
+    def _load_mix_data(self, track_dir: str):
+        stems = self.metadata.get(track_dir)
+        if stems is None:
+            stems = parse_slakh_metadata(track_dir)
+            self.metadata[track_dir] = stems
+
         note_seqs = []
         for stem_id, stem_info in stems.items():
-            try:
-                result = load_stem(track_dir, stem_id, stem_info)
-                if result is None:
-                    continue
-                _, note_seq = result
-                note_seqs.append(note_seq)
-            except Exception as e:
-                print(f"Warning: Could not load stem {stem_id} from {track_dir}: {e}")
+            result = load_stem(track_dir, stem_id, stem_info)
+            if result is None:
                 continue
+            _, note_seq_obj = result
+            note_seqs.append(note_seq_obj)
 
-        # Load mixed audio
         mix_path = os.path.join(track_dir, "mix.flac")
         if not os.path.exists(mix_path):
             mix_path = os.path.join(track_dir, "mix.wav")
 
         mix_audio, _ = librosa.load(mix_path, sr=DEFAULT_SAMPLE_RATE)
-
-        # Merge all MIDI with program numbers
         merged_ns = merge_note_sequences(note_seqs)
+        return {"audio": mix_audio, "note_sequence": merged_ns}
+
+    def warm_cache_for_workers(self):
+        if self.preload_all or self._track_cache is None:
+            return
+        tracks_to_warm = self.track_paths[: self._track_cache.maxsize]
+        print(f"[SLAKH-MIX][{self.split}] Warming raw mix cache with {len(tracks_to_warm)} tracks")
+        for track_dir in tracks_to_warm:
+            try:
+                self._track_cache.get(track_dir)
+            except Exception as exc:
+                print(f"[SLAKH-MIX][{self.split}] Warning: failed to warm {track_dir}: {exc}")
+
+    def _get_track(self, idx: int):
+        track_dir = self.track_paths[idx]
+        if self.preload_all:
+            data = self._preloaded_tracks[idx]
+            if data is None:
+                raise FileNotFoundError(f"Preloaded data missing for {track_dir}")
+            return data
+        if self._track_cache is not None:
+            return self._track_cache.get(track_dir)
+        return self._load_mix_data(track_dir)
+
+    def __getitem__(self, idx):
+        """Get a full mix sample."""
+        try:
+            track_data = self._get_track(idx)
+        except Exception:
+            return self.__getitem__((idx + 1) % len(self))
+
+        mix_audio = track_data["audio"]
+        merged_ns = track_data["note_sequence"]
 
         # Convert audio to mel spectrogram
         mel = self._compute_mel_spectrogram(mix_audio)

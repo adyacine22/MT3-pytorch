@@ -6,5 +6,7 @@ __pycache__/
 checkpoint/
 eval_outputs/
 inference_outputs/
-cache/
 mt3_legacy_code/
+cache/
+benchmark/
+
