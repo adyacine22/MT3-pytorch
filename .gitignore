@@ -8,6 +8,6 @@ inference_outputs/
 mt3_legacy_code/
 cache/
 benchmark/
-test_files/
 datasets/
+test_files/
 

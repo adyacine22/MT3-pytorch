@@ -45,6 +45,28 @@ PROJECT_CONFIG = {
             "chunk_frames": 256,
             "chunk_samples": 32768,
             "num_mels": 512,
+            "n_fft": 2048,
+            "win_length": 2048,
+            "window": "hann",
+            "center": True,
+            "mel_fmin": 20.0,
+            "mel_fmax": 8000.0,
+            "mel_power": 2.0,
+            "log_epsilon": 1e-5,
+        },
+        "augment": {
+            "noise_snr_db": [15.0, 30.0],
+            "eq_gain_db": [-3.0, 3.0],
+            "clip_dbfs": -3.0,
+            "gain_jitter_db": [-3.0, 3.0],
+            "rir_params": {
+                "room_dim": [6.0, 5.0, 3.0],
+                "absorption": 0.4,
+                "max_order": 4,
+                "source_height": 1.5,
+                "mic_height": 1.5,
+                "position_jitter": 0.3,
+            },
         },
     },
     "symbolic": {
@@ -52,6 +74,13 @@ PROJECT_CONFIG = {
             "steps_per_second": 125,
             "max_shift_ms": 2048,
             "num_velocity_bins": 1,
+        },
+        "tokenizer": {
+            "include_ties": True,
+            "onsets_only": False,
+            "apply_sustain": True,
+            "trim_overlapping_notes": True,
+            "max_token_length": 1024,
         }
     },
 }

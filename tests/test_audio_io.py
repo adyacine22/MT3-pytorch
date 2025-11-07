@@ -3,15 +3,20 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import shutil
+import sys
 
 import numpy as np
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from data.audio.io import prepare_waveform
 from configs import load_project_config
 
 
 CONFIG = load_project_config()
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = ROOT
 DATASET_PATHS = CONFIG["paths"]["datasets"]
 UNIFIED_INDEX_PATH = PROJECT_ROOT / DATASET_PATHS["unified_index"]
 TEST_OUTPUT_DIR = PROJECT_ROOT / "test_files"
