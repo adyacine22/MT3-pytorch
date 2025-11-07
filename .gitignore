@@ -1,7 +1,6 @@
 cpt/
 mt3-pytorch/
 wandb/
-datasets/
 __pycache__/
 checkpoint/
 eval_outputs/
@@ -9,4 +8,6 @@ inference_outputs/
 mt3_legacy_code/
 cache/
 benchmark/
+test_files/
+datasets/
 
