@@ -1,7 +1,7 @@
 """Waveform augmentation utilities."""
 from __future__ import annotations
 
-from typing import Optional
+from typing import Iterable, Optional
 
 import torch
 import torchaudio
@@ -18,34 +18,46 @@ IO_CFG = CONFIG["audio"]["io"]
 def apply_augmentation(
     waveform: torch.Tensor,
     sample_rate: int,
-    profile: str = "none",
+    profiles: Iterable[str] | str = "none",
     seed: Optional[int] = None,
 ) -> torch.Tensor:
-    """Apply augmentation profile to a waveform tensor."""
-    if profile == "none" or not AUG_CFG:
+    """Apply one or more augmentation profiles sequentially."""
+    if not AUG_CFG:
+        return waveform
+    if isinstance(profiles, str):
+        profile_list = [profiles]
+    else:
+        profile_list = list(profiles)
+    if not profile_list:
         return waveform
     waveform = waveform.to(dtype=torch.float32)
+    target_len = waveform.shape[-1]
 
     rng = torch.Generator(device=waveform.device)
     if seed is not None:
         rng.manual_seed(seed)
-
-    if profile == "rir":
-        rir_params = AUG_CFG.get("rir_params", {})
-        return _apply_rir(waveform, sample_rate, rir_params, rng)
-    if profile == "noise":
-        snr_range = AUG_CFG.get("noise_snr_db", [-5, 5])
-        return _apply_noise(waveform, snr_range, rng)
-    if profile == "eq":
-        gains = AUG_CFG.get("eq_gain_db", [-3, 3])
-        return _apply_eq(waveform, gains, rng)
-    if profile == "clip":
-        threshold = AUG_CFG.get("clip_dbfs", -3.0)
-        return _apply_clipping(waveform, threshold)
-    if profile == "gain":
-        jitter_db = AUG_CFG.get("gain_jitter_db", [-3, 3])
-        return _apply_gain_jitter(waveform, jitter_db, rng)
-    return waveform
+    augmented = waveform
+    for profile in profile_list:
+        name = (profile or "").strip().lower()
+        if name in {"", "none"}:
+            continue
+        if name == "rir":
+            rir_params = AUG_CFG.get("rir_params", {})
+            augmented = _apply_rir(augmented, sample_rate, rir_params, rng)
+        elif name == "noise":
+            snr_range = AUG_CFG.get("noise_snr_db", [-5, 5])
+            augmented = _apply_noise(augmented, snr_range, rng)
+        elif name == "eq":
+            gains = AUG_CFG.get("eq_gain_db", [-3, 3])
+            augmented = _apply_eq(augmented, gains, rng)
+        elif name == "clip":
+            threshold = AUG_CFG.get("clip_dbfs", -3.0)
+            augmented = _apply_clipping(augmented, threshold)
+        elif name == "gain":
+            jitter_db = AUG_CFG.get("gain_jitter_db", [-3, 3])
+            augmented = _apply_gain_jitter(augmented, jitter_db, rng)
+        augmented = _match_length(augmented, target_len)
+    return augmented
 
 
 def _apply_rir(waveform: torch.Tensor, sample_rate: int, params: dict, rng: torch.Generator) -> torch.Tensor:
@@ -127,4 +139,14 @@ def _apply_gain_jitter(waveform: torch.Tensor, jitter_db: list[float], rng: torc
     gain_db = gain_tensor.item()
     gain = 10 ** (gain_db / 20)
     return waveform * gain
+
+
+def _match_length(waveform: torch.Tensor, target_len: int) -> torch.Tensor:
+    if waveform.shape[-1] == target_len:
+        return waveform
+    if waveform.shape[-1] > target_len:
+        return waveform[..., :target_len]
+    pad_len = target_len - waveform.shape[-1]
+    pad = torch.zeros(pad_len, device=waveform.device, dtype=waveform.dtype)
+    return torch.cat([waveform, pad], dim=-1)
 import numpy as np

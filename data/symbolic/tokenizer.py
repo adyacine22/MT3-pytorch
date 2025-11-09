@@ -90,10 +90,10 @@ def tokenize_note_sequence(
     if chunk_end_s <= chunk_start_s:
         raise ValueError("chunk_end_s must be greater than chunk_start_s")
 
-    include_ties = (
+    include_ties_flag: bool = (
         TOKENIZER_CFG.get("include_ties", True) if include_ties is None else include_ties
     )
-    onsets_only = (
+    onsets_only_flag: bool = (
         TOKENIZER_CFG.get("onsets_only", False) if onsets_only is None else onsets_only
     )
 
@@ -107,14 +107,14 @@ def tokenize_note_sequence(
 
     working_sequence = _prepare_sequence(note_sequence)
     state = _initial_state(
-        working_sequence, chunk_start_s, include_ties=include_ties
+        working_sequence, chunk_start_s, include_ties=include_ties_flag
     )
 
     event_times, event_values = _collect_note_events(
         working_sequence,
         chunk_start_s=chunk_start_s,
         chunk_end_s=chunk_end_s,
-        onsets_only=onsets_only,
+        onsets_only=onsets_only_flag,
     )
 
     (
@@ -124,7 +124,7 @@ def tokenize_note_sequence(
         state_events,
         state_event_indices,
     ) = _encode_and_index_events(
-        state=state if include_ties else None,
+        state=state if include_ties_flag else None,
         event_times=event_times,
         event_values=event_values,
         frame_times=frame_times,

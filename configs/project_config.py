@@ -23,6 +23,7 @@ PROJECT_CONFIG = {
         "cache": {
             "root": "cache",
             "chunk_manifest": "cache/chunk_manifest.parquet",
+            "precomputed_chunks": "cache/precomputed_chunks",
         },
     },
     "audio": {
@@ -81,6 +82,23 @@ PROJECT_CONFIG = {
             "apply_sustain": True,
             "trim_overlapping_notes": True,
             "max_token_length": 1024,
+        }
+    },
+    "compute": {
+        "preprocessing": {
+            "chunk_device": "cuda:0",
+            "augment_enabled": True,
+            "augment_profiles": ["noise"],
+            "batch_size": 256,
+            "tokenize_workers": 30,
+            "datasets": ["maestro", "slakh_full_mix", "slakh_stem"],
+            "max_tracks_per_dataset": None,
+            "max_chunks_per_track": None,
+            "dry_run": False,
+            "overwrite": False,
+            "store_spectrogram": True,
+            "write_manifest": False,
+            "skip_existing": True,
         }
     },
 }

@@ -65,18 +65,16 @@ def test_apply_augmentation_profiles(tmp_path):
 
     profiles = ["rir", "noise", "eq", "clip", "gain"]
     for profile in profiles:
-        augmented = augment.apply_augmentation(chunk, sr, profile=profile, seed=42)
+        augmented = augment.apply_augmentation(chunk, sr, profiles=profile, seed=42)
         audio_out = output_root / f"{Path(entry['audio_path']).stem}_{profile}.wav"
         _save_audio(audio_out, augmented, sr)
         print(f"Saved {profile} augmentation to {audio_out}")
 
     # Combined augmentation sequence
-    combined = chunk.clone()
-    for profile in profiles:
-        combined = augment.apply_augmentation(combined, sr, profile=profile, seed=42)
-        combined_out = output_root / f"{Path(entry['audio_path']).stem}_combined.wav"
-        _save_audio(combined_out, combined, sr)
-        print(f"Saved combined augmentation to {combined_out}")
+    combined = augment.apply_augmentation(chunk.clone(), sr, profiles=profiles, seed=42)
+    combined_out = output_root / f"{Path(entry['audio_path']).stem}_combined.wav"
+    _save_audio(combined_out, combined, sr)
+    print(f"Saved combined augmentation to {combined_out}")
 
 
 if __name__ == "__main__":

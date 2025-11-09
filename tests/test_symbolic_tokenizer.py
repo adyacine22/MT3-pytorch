@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import sys
 
@@ -16,6 +17,33 @@ CONFIG = load_project_config()
 AUDIO_CFG = CONFIG["audio"]
 FEATURE_CFG = AUDIO_CFG["features"]
 IO_CFG = AUDIO_CFG["io"]
+
+DEBUG_OUTPUT = os.environ.get("TOKENIZER_DEBUG", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+}
+
+
+def _debug_print(label: str, output: tokenizer.TokenizerOutput) -> None:
+    if not DEBUG_OUTPUT:
+        return
+    print(f"--- {label} ---")
+    print(f"tokens ({len(output.tokens)}): {output.tokens}")
+    print(
+        f"event_start_indices ({len(output.event_start_indices)}): "
+        f"{output.event_start_indices}"
+    )
+    print(
+        f"event_end_indices ({len(output.event_end_indices)}): "
+        f"{output.event_end_indices}"
+    )
+    print(f"state_events ({len(output.state_events)}): {output.state_events}")
+    print(
+        f"state_event_indices ({len(output.state_event_indices)}): "
+        f"{output.state_event_indices}"
+    )
+    print("------------------")
 
 
 def _build_sequence() -> note_seq.NoteSequence:
@@ -50,6 +78,7 @@ def test_tokenize_basic_sequence():
         sample_rate=IO_CFG["sample_rate"],
         hop_length=FEATURE_CFG["hop_length"],
     )
+    _debug_print("basic_sequence", output)
     assert output.tokens, "Tokenizer should emit tokens for active notes"
     assert len(output.event_start_indices) == FEATURE_CFG["chunk_frames"]
     assert output.event_end_indices[-1] == len(output.tokens)
@@ -66,10 +95,19 @@ def test_tokenize_emits_tie_state_for_continuations():
         sample_rate=IO_CFG["sample_rate"],
         hop_length=FEATURE_CFG["hop_length"],
     )
+    _debug_print("tie_state_sequence", output)
     assert vocabulary.tie_id() in output.state_events
     assert output.state_events.count(vocabulary.tie_id()) >= 1
 
 
-if __name__ == "__main__":
+def _run_as_script() -> None:
+    global DEBUG_OUTPUT
+    DEBUG_OUTPUT = True
+    print("Running tokenizer debug harness...\n")
     test_tokenize_basic_sequence()
     test_tokenize_emits_tie_state_for_continuations()
+    print("\nAll tokenizer checks passed.")
+
+
+if __name__ == "__main__":
+    _run_as_script()

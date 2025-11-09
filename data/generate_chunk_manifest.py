@@ -79,8 +79,15 @@ def generate_jobs(
     chunk_samples: int,
     sample_rate: int,
     hop_length: int,
+    compute_cfg: Dict,
+    precomputed_dir: Path,
 ) -> List[Dict]:
     jobs: List[Dict] = []
+    augment_enabled = bool(compute_cfg.get("augment_enabled", False))
+    augment_profiles = compute_cfg.get("augment_profiles", ["none"])
+    if isinstance(augment_profiles, str):
+        augment_profiles = [augment_profiles]
+
     for entry in entries:
         duration_ms = compute_duration_ms(entry)
         if duration_ms <= 0:
@@ -128,6 +135,14 @@ def generate_jobs(
                 "instrument_classes": entry.get("instrument_classes", []),
                 "is_drum": bool(entry.get("is_drum", False)),
                 "metadata_hash": f"{track_id}-{start_ms:.0f}-{end_ms:.0f}",
+                "precomputed_path": str((precomputed_dir / f"{chunk_id}.pt").as_posix()),
+                "precompute": {
+                    "chunk_device": compute_cfg.get("chunk_device", "auto"),
+                    "batch_size": compute_cfg.get("batch_size"),
+                    "tokenize_workers": compute_cfg.get("tokenize_workers"),
+                    "augment_enabled": augment_enabled,
+                    "augment_profiles": augment_profiles if augment_enabled else ["none"],
+                },
             }
             jobs.append(job)
     logger.info("Generated %d chunk jobs", len(jobs))
@@ -174,6 +189,9 @@ def main() -> None:
     chunk_samples = feature_cfg["chunk_samples"]
     chunk_duration_default = chunk_samples / sample_rate * 1000.0
     chunk_duration_ms = args.chunk_duration_ms or chunk_duration_default
+    compute_cfg = cfg.get("compute", {}).get("preprocessing", {})
+    cache_paths = cfg["paths"]["cache"]
+    precomputed_dir = PROJECT_ROOT / cache_paths.get("precomputed_chunks", Path(cache_paths["root"]) / "precomputed_chunks")
 
     entries = load_unified_entries(args.unified_index)
     jobs = generate_jobs(
@@ -183,6 +201,8 @@ def main() -> None:
         chunk_samples=chunk_samples,
         sample_rate=sample_rate,
         hop_length=feature_cfg["hop_length"],
+        compute_cfg=compute_cfg,
+        precomputed_dir=precomputed_dir,
     )
     save_manifest(jobs, args.output)
     logger.info("Chunk manifest generation complete.")
