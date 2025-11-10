@@ -15,7 +15,7 @@ TEST_SCRIPT = ROOT / "tests" / "test_preprocessing_timing.py"
 # Define the sweep grids here.
 CHUNK_DEVICES = ["cpu", "cuda:0"]
 BATCH_SIZES = [128, 256]
-TOKENIZE_WORKERS_OPTIONS = [16, 30]
+MAX_TOKENIZE_WORKERS_OPTIONS = [16, 30]
 AUGMENT_ENABLED_OPTIONS = [False, True]
 AUGMENT_PROFILE_COMBOS = [["noise"], ["noise", "eq", "rir", "gain", "clip"]]
 
@@ -24,7 +24,7 @@ def main() -> None:
     combos = []
     for chunk_device in CHUNK_DEVICES:
         for batch_size in BATCH_SIZES:
-            for tokenize_workers in TOKENIZE_WORKERS_OPTIONS:
+            for max_tokenize_workers in MAX_TOKENIZE_WORKERS_OPTIONS:
                 for augment_enabled in AUGMENT_ENABLED_OPTIONS:
                     profile_list = AUGMENT_PROFILE_COMBOS if augment_enabled else [["none"]]
                     for profiles in profile_list:
@@ -32,7 +32,7 @@ def main() -> None:
                             {
                                 "chunk_device": chunk_device,
                                 "batch_size": batch_size,
-                                "tokenize_workers": tokenize_workers,
+                                "max_tokenize_workers": max_tokenize_workers,
                                 "augment_enabled": augment_enabled,
                                 "augment_profiles": profiles,
                             }

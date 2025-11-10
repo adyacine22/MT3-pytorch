@@ -139,7 +139,7 @@ def generate_jobs(
                 "precompute": {
                     "chunk_device": compute_cfg.get("chunk_device", "auto"),
                     "batch_size": compute_cfg.get("batch_size"),
-                    "tokenize_workers": compute_cfg.get("tokenize_workers"),
+                    "max_tokenize_workers": compute_cfg.get("max_tokenize_workers"),
                     "augment_enabled": augment_enabled,
                     "augment_profiles": augment_profiles if augment_enabled else ["none"],
                 },

@@ -9,6 +9,7 @@ import note_seq  # type: ignore
 from data.symbolic import vocabulary
 
 STEPS_PER_SECOND = vocabulary.STEPS_PER_SECOND
+MIN_MIDI_PITCH = vocabulary.MIN_MIDI_PITCH
 SPECIAL_TOKENS = {vocabulary.PAD_ID, vocabulary.EOS_ID, vocabulary.UNK_ID}
 
 
@@ -42,7 +43,7 @@ def _seed_active_state(
         if event_type == "program":
             program = value
         elif event_type == "pitch":
-            pitch = value + 21
+            pitch = value + MIN_MIDI_PITCH
             note = ns.notes.add()
             note.pitch = pitch
             note.velocity = 100
@@ -134,9 +135,9 @@ def tokens_to_note_sequence(
             event_type, value = vocabulary.decode_event(tokens[idx])
 
         if event_type != "velocity":
-            if event_type == "pitch":
-                # onsets-only mode without velocities
-                pitch = value + 21
+        if event_type == "pitch":
+            # onsets-only mode without velocities
+            pitch = value + MIN_MIDI_PITCH
                 velocity_bin = vocabulary.NUM_VELOCITY_BINS
                 add_note(pitch, program, velocity_bin, is_drum=False)
                 idx += 1
@@ -151,10 +152,10 @@ def tokens_to_note_sequence(
             break
         event_type, value = vocabulary.decode_event(tokens[idx])
         if event_type == "pitch":
-            pitch = value + 21
+            pitch = value + MIN_MIDI_PITCH
             add_note(pitch, program, velocity_bin, is_drum=False)
         elif event_type == "drum":
-            pitch = value + 21
+            pitch = value + MIN_MIDI_PITCH
             add_note(pitch, program, velocity_bin, is_drum=True)
         else:
             # Malformed sequence, skip token

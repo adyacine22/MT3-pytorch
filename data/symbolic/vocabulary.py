@@ -12,6 +12,9 @@ CODEC_CFG = CONFIG["symbolic"]["codec"]
 STEPS_PER_SECOND = CODEC_CFG["steps_per_second"]
 MAX_SHIFT_MS = CODEC_CFG["max_shift_ms"]
 NUM_VELOCITY_BINS = CODEC_CFG["num_velocity_bins"]
+MIN_MIDI_PITCH = 0
+MAX_MIDI_PITCH = 127
+PITCH_RANGE = MAX_MIDI_PITCH - MIN_MIDI_PITCH + 1
 
 
 PAD_ID = 0
@@ -39,11 +42,11 @@ def build_event_ranges() -> List[VocabularyRange]:
     max_shift_steps = (STEPS_PER_SECOND * MAX_SHIFT_MS) // 1000
     add_range("shift", max_shift_steps)
 
-    add_range("pitch", 88)  # MIDI notes 21-108
+    add_range("pitch", PITCH_RANGE)
     add_range("velocity", max(1, NUM_VELOCITY_BINS) + 1)
     add_range("tie", 1)
     add_range("program", 128)
-    add_range("drum", 88)  # drum pitch classes
+    add_range("drum", PITCH_RANGE)
     return ranges
 
 
@@ -65,7 +68,7 @@ def shift_id(steps: int) -> int:
 
 
 def pitch_id(midi_pitch: int) -> int:
-    return id_for_event("pitch", midi_pitch - 21)
+    return id_for_event("pitch", midi_pitch - MIN_MIDI_PITCH)
 
 
 def velocity_id(velocity_bin: int) -> int:
@@ -81,7 +84,7 @@ def program_id(program: int) -> int:
 
 
 def drum_id(drum_pitch: int) -> int:
-    return id_for_event("drum", drum_pitch - 21)
+    return id_for_event("drum", drum_pitch - MIN_MIDI_PITCH)
 
 
 def decode_event(token_id: int) -> Tuple[str, int]:
@@ -92,3 +95,23 @@ def decode_event(token_id: int) -> Tuple[str, int]:
         if r.min_id <= token_id <= r.max_id:
             return r.name, token_id - r.min_id
     raise ValueError(f"Unknown token id {token_id}")
+
+
+__all__ = [
+    "PAD_ID",
+    "EOS_ID",
+    "UNK_ID",
+    "STEPS_PER_SECOND",
+    "MAX_SHIFT_MS",
+    "NUM_VELOCITY_BINS",
+    "MIN_MIDI_PITCH",
+    "MAX_MIDI_PITCH",
+    "EVENT_RANGES",
+    "shift_id",
+    "pitch_id",
+    "velocity_id",
+    "tie_id",
+    "program_id",
+    "drum_id",
+    "decode_event",
+]

@@ -13,14 +13,18 @@ from data.symbolic import vocabulary
 
 
 def test_pitch_ids():
-    min_id = vocabulary.pitch_id(21)
-    max_id = vocabulary.pitch_id(108)
-    print(f"pitch_id(21) -> {min_id}, expected {vocabulary.EVENT_RANGES[1].min_id}")
-    print(f"pitch_id(108) -> {max_id}, expected {vocabulary.EVENT_RANGES[1].max_id}")
+    min_pitch = vocabulary.MIN_MIDI_PITCH
+    max_pitch = vocabulary.MAX_MIDI_PITCH
+    min_id = vocabulary.pitch_id(min_pitch)
+    max_id = vocabulary.pitch_id(max_pitch)
+    print(f"pitch_id({min_pitch}) -> {min_id}, expected {vocabulary.EVENT_RANGES[1].min_id}")
+    print(f"pitch_id({max_pitch}) -> {max_id}, expected {vocabulary.EVENT_RANGES[1].max_id}")
     assert min_id == vocabulary.EVENT_RANGES[1].min_id
     assert max_id == vocabulary.EVENT_RANGES[1].max_id
     with pytest.raises(ValueError):
-        vocabulary.pitch_id(20)
+        vocabulary.pitch_id(min_pitch - 1)
+    with pytest.raises(ValueError):
+        vocabulary.pitch_id(max_pitch + 1)
 
 
 def test_shift_ids():
@@ -41,7 +45,7 @@ def test_decode_roundtrip():
     name, value = vocabulary.decode_event(token)
     print(f"decode_event({token}) -> (name={name}, value={value})")
     assert name == "pitch"
-    assert value == 60 - 21
+    assert value == 60 - vocabulary.MIN_MIDI_PITCH
 
 
 if __name__ == "__main__":

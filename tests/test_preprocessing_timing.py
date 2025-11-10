@@ -49,6 +49,7 @@ from data.audio import io as audio_io
 from data.audio import spectrogram
 from data.audio.augment import apply_augmentation
 from data.symbolic import tokenizer
+from scripts.precompute_chunks import select_tokenize_workers
 
 CONFIG = load_project_config()
 AUDIO_CFG = CONFIG["audio"]
@@ -76,7 +77,9 @@ if isinstance(_PROFILE_VALUE, str):
 else:
     AUGMENT_PROFILES = [str(name) for name in _PROFILE_VALUE] or ["none"]
 BATCH_SIZE = max(1, int(COMPUTE_CFG.get("batch_size", 1)))
-TOKENIZE_WORKERS = max(0, int(COMPUTE_CFG.get("tokenize_workers", os.cpu_count() or 1)))
+MAX_TOKENIZE_WORKERS = max(
+    0, int(COMPUTE_CFG.get("max_tokenize_workers", os.cpu_count() or 1))
+)
 DATASETS_ROOT = PROJECT_ROOT / "datasets"
 LOG_DIR = PROJECT_ROOT / "test_files" / "test_preprocessing_benchmark"
 LOG_LINES: List[str] = []
@@ -120,7 +123,8 @@ def _write_log_file(device_label: str) -> Path:
     device_slug = (device_label or "auto").replace(":", "_")
     profiles_slug = "-".join(AUGMENT_PROFILES) if AUGMENT_PROFILES else "none"
     filename = (
-        f"preprocessing_batch{BATCH_SIZE}_tokenizers{TOKENIZE_WORKERS}_aug{aug_label}_profiles{profiles_slug}_device{device_slug}.log"
+        f"preprocessing_batch{BATCH_SIZE}_max_tokenizers{MAX_TOKENIZE_WORKERS}"
+        f"_aug{aug_label}_profiles{profiles_slug}_device{device_slug}.log"
     )
     log_path = LOG_DIR / filename
     with log_path.open("w") as fp:
@@ -316,7 +320,7 @@ def _run_pipeline(case: SampleCase) -> Tuple[Dict[str, float], Dict[str, Any]]:
         "chunk_device_pref": CHUNK_DEVICE_PREF,
         "augment_enabled": AUGMENT_ENABLED,
         "augment_profiles": AUGMENT_PROFILES,
-        "tokenize_workers": TOKENIZE_WORKERS,
+        "max_tokenize_workers": MAX_TOKENIZE_WORKERS,
     }
 
     _log(
@@ -351,13 +355,15 @@ def _run_pipeline(case: SampleCase) -> Tuple[Dict[str, float], Dict[str, Any]]:
     plans = _plan_chunk_positions(total_samples, sample_rate, chunk_samples)
     info["planned_chunks"] = len(plans)
     info["batch_size"] = BATCH_SIZE
+    adaptive_workers = select_tokenize_workers(note_sequence, len(plans), MAX_TOKENIZE_WORKERS)
+    info["tokenize_workers_used"] = adaptive_workers
 
     chunk_device = _chunk_device()
     info["chunk_device_pref"] = chunk_device or "auto"
     chunk_results: List[Dict[str, Any]] = []
     batch_id = 0
     token_futures: List[Tuple[Any, Dict[str, Any], Dict[str, Any]]] = []
-    token_pool = ProcessPoolExecutor(max_workers=TOKENIZE_WORKERS) if TOKENIZE_WORKERS > 0 else None
+    token_pool = ProcessPoolExecutor(max_workers=adaptive_workers) if adaptive_workers > 0 else None
     serialized_ns = note_sequence.SerializeToString()
     chunk_counter = 0
 
@@ -578,7 +584,7 @@ def _print_report(results: Dict[str, Dict[str, Any]], elapsed_time: float) -> No
     _log(
         f"Compute config: inferred chunks per track | "
         f"batch_size={BATCH_SIZE} | "
-        f"tokenize_workers={TOKENIZE_WORKERS} | "
+        f"max_tokenize_workers={MAX_TOKENIZE_WORKERS} | "
         f"chunk_device_pref={CHUNK_DEVICE_PREF} | "
         f"augment_profiles={AUGMENT_PROFILES}"
     )
@@ -602,6 +608,12 @@ def _print_report(results: Dict[str, Dict[str, Any]], elapsed_time: float) -> No
         aug_state = "on" if info.get("augment_enabled") else "off"
         profiles_desc = ", ".join(info.get("augment_profiles", ["none"]))
         _log(f"    augment={aug_state} (profiles=[{profiles_desc}])")
+        _log(
+            "    tokenize_workers_used={used} (max={max_cap})".format(
+                used=info.get("tokenize_workers_used", 0),
+                max_cap=info.get("max_tokenize_workers", MAX_TOKENIZE_WORKERS),
+            )
+        )
         _log(
             "    duration={duration:.2f}s | sample_rate={sample_rate} Hz | "
             "chunk_duration={chunk_duration:.3f}s | planned_chunks={planned} | actual_chunks={actual}".format(

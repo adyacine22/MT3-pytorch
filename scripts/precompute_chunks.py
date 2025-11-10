@@ -96,8 +96,8 @@ def _load_config() -> Tuple[Dict[str, Any], Dict[str, Any]]:
         "augment_enabled": bool(compute_cfg.get("augment_enabled", False)),
         "augment_profiles": augment_profiles,
         "batch_size": max(1, int(compute_cfg.get("batch_size", 1))),
-        "tokenize_workers": max(
-            0, int(compute_cfg.get("tokenize_workers", os.cpu_count() or 1))
+        "max_tokenize_workers": max(
+            0, int(compute_cfg.get("max_tokenize_workers", os.cpu_count() or 1))
         ),
         "chunk_samples": int(feature_cfg["chunk_samples"]),
         "hop_length": int(feature_cfg["hop_length"]),
@@ -210,6 +210,35 @@ def _plan_chunk_positions(
     return positions
 
 
+TOKENIZE_WORKER_THRESHOLDS: List[Tuple[float, int]] = [
+    (500.0, 1),
+    (1500.0, 4),
+    (3500.0, 16),
+    (float("inf"), 32),
+]
+
+
+def estimate_work_units(note_sequence: note_seq.NoteSequence, chunk_count: int) -> float:
+    duration = max(float(note_sequence.total_time), 1e-6)
+    density = len(note_sequence.notes) / duration if duration > 0 else 0.0
+    return density * max(1, chunk_count)
+
+
+def select_tokenize_workers(
+    note_sequence: note_seq.NoteSequence,
+    chunk_count: int,
+    max_tokenize_workers: int,
+) -> int:
+    """Select an adaptive worker count based on event density and chunk count."""
+    if max_tokenize_workers <= 0:
+        return 0
+    work_units = estimate_work_units(note_sequence, chunk_count)
+    for threshold, worker_target in TOKENIZE_WORKER_THRESHOLDS:
+        if work_units < threshold:
+            return min(worker_target, max_tokenize_workers)
+    return min(TOKENIZE_WORKER_THRESHOLDS[-1][1], max_tokenize_workers)
+
+
 def _batched(plans: List[Dict[str, float]], batch_size: int) -> Iterable[List[Dict[str, float]]]:
     if batch_size <= 1:
         for plan in plans:
@@ -251,6 +280,7 @@ def _save_chunk(
     dest_dir: Path,
     chunk_slug: str,
     log_mel: torch.Tensor | None,
+    waveform: torch.Tensor | None,
     frame_times: Sequence[float],
     tokens: Sequence[int],
     meta: Dict[str, Any],
@@ -277,6 +307,8 @@ def _save_chunk(
     }
     if log_mel is not None:
         payload["log_mel"] = log_mel.cpu()
+    if waveform is not None:
+        payload["waveform"] = waveform.detach().cpu().to(dtype=torch.float16)
     torch.save(payload, chunk_path)
     return chunk_path
 
@@ -295,9 +327,13 @@ def _process_case(
     plans = _plan_chunk_positions(len(waveform), sample_rate, chunk_samples)
     chunk_duration_s = chunk_samples / sample_rate
 
+    planned_chunk_count = len(plans)
+    adaptive_workers = select_tokenize_workers(
+        note_sequence, planned_chunk_count, options["max_tokenize_workers"]
+    )
     token_pool: ProcessPoolExecutor | None = (
-        ProcessPoolExecutor(max_workers=options["tokenize_workers"])
-        if options["tokenize_workers"] > 0
+        ProcessPoolExecutor(max_workers=adaptive_workers)
+        if adaptive_workers > 0
         else None
     )
     token_futures: List[Tuple[Future, Dict[str, Any], Dict[str, Any]]] = []
@@ -344,23 +380,25 @@ def _process_case(
                 "chunk_slug": chunk_slug,
                 "chunk_path": chunk_path,
             }
+            chunk = audio_io.slice_chunk(
+                waveform,
+                start_sample=int(plan["start_sample"]),
+                chunk_samples=chunk_samples,
+                pad_value=options["pad_value"],
+            )
+            chunk_tensor = torch.as_tensor(
+                chunk,
+                dtype=torch.float32,
+                device=options["chunk_device"] or "cpu",
+            )
+            if options["augment_enabled"]:
+                chunk_tensor = apply_augmentation(
+                    chunk_tensor, sample_rate=sample_rate, profiles=options["augment_profiles"]
+                )
             if options["store_spectrogram"]:
-                chunk = audio_io.slice_chunk(
-                    waveform,
-                    start_sample=int(plan["start_sample"]),
-                    chunk_samples=chunk_samples,
-                    pad_value=options["pad_value"],
-                )
-                chunk_tensor = torch.as_tensor(
-                    chunk,
-                    dtype=torch.float32,
-                    device=options["chunk_device"] or "cpu",
-                )
-                if options["augment_enabled"]:
-                    chunk_tensor = apply_augmentation(
-                        chunk_tensor, sample_rate=sample_rate, profiles=options["augment_profiles"]
-                    )
                 chunk_entry["tensor"] = chunk_tensor
+            else:
+                chunk_entry["waveform_cpu"] = chunk_tensor.detach().to("cpu")
             batch_data.append(chunk_entry)
             chunk_counter += 1
 
@@ -395,6 +433,9 @@ def _process_case(
                 frame_times = [idx * hop_seconds for idx in range(frames)]
                 spectrogram_device = "none"
                 stored_log_mel = None
+            stored_waveform = None
+            if not options["store_spectrogram"]:
+                stored_waveform = chunk_data.pop("waveform_cpu", None)
             chunk_meta = {
                 "chunk_index": chunk_data["chunk_index"],
                 "chunk_start_s": chunk_data["chunk_start_s"],
@@ -406,10 +447,13 @@ def _process_case(
                 "audio_path": metadata.get("audio_path"),
                 "midi_path": metadata.get("midi_path"),
                 "augment_profiles": options["augment_profiles"] if options["augment_enabled"] else [],
+                "tokenize_workers": adaptive_workers,
+                "max_tokenize_workers": options["max_tokenize_workers"],
             }
             chunk_slug = chunk_data["chunk_slug"]
             chunk_payload = {
                 "log_mel": stored_log_mel,
+                "waveform": stored_waveform,
                 "frame_times": frame_times,
                 "meta": chunk_meta,
                 "slug": chunk_slug,
@@ -434,18 +478,19 @@ def _process_case(
                 chunk_path = _save_chunk(
                     dest_dir,
                     chunk_slug,
-                chunk_payload["log_mel"],
-                frame_times,
-                token_output.tokens,
-                chunk_meta,
-                dry_run,
-                overwrite,
-            )
-            written_chunks += 1
-            if options["write_manifest"]:
-                manifest_rows.append(
-                    _manifest_row(chunk_meta, chunk_path, token_output.tokens, options)
+                    chunk_payload["log_mel"],
+                    chunk_payload["waveform"],
+                    frame_times,
+                    token_output.tokens,
+                    chunk_meta,
+                    dry_run,
+                    overwrite,
                 )
+                written_chunks += 1
+                if options["write_manifest"]:
+                    manifest_rows.append(
+                        _manifest_row(chunk_meta, chunk_path, token_output.tokens, options)
+                    )
 
         if options["store_spectrogram"]:
             del stacked, log_mel_batch
@@ -458,6 +503,7 @@ def _process_case(
                 dest_dir,
                 chunk_payload["slug"],
                 chunk_payload["log_mel"],
+                chunk_payload["waveform"],
                 chunk_payload["frame_times"],
                 tokens,
                 chunk_meta,
@@ -490,7 +536,8 @@ def _manifest_row(
         "spectrogram_device": chunk_meta["spectrogram_device"],
         "augment_profiles": ",".join(chunk_meta["augment_profiles"]),
         "batch_size": options["batch_size"],
-        "tokenize_workers": options["tokenize_workers"],
+        "tokenize_workers_used": chunk_meta["tokenize_workers"],
+        "max_tokenize_workers": options["max_tokenize_workers"],
         "chunk_samples": options["chunk_samples"],
         "sample_rate": options["sample_rate"],
     }
@@ -524,6 +571,9 @@ def process_unified_index() -> Path:
     env_max_chunks = os.environ.get("PRECOMPUTE_MAX_CHUNKS")
     if env_max_chunks:
         options["max_chunks_per_track"] = _parse_limited_int(env_max_chunks)
+    env_max_token_workers = os.environ.get("PRECOMPUTE_MAX_TOKENIZE_WORKERS")
+    if env_max_token_workers:
+        options["max_tokenize_workers"] = max(0, int(env_max_token_workers))
     options["dry_run"] = _parse_bool(os.environ.get("PRECOMPUTE_DRY_RUN"), options["dry_run"])
     options["overwrite"] = _parse_bool(
         os.environ.get("PRECOMPUTE_OVERWRITE"), options["overwrite"]
@@ -544,6 +594,7 @@ def process_unified_index() -> Path:
         f"max_tracks={options['max_tracks_per_dataset'] or 'all'} "
         f"max_chunks={options['max_chunks_per_track'] or 'all'} "
         f"dry_run={options['dry_run']} overwrite={options['overwrite']} "
+        f"max_tokenize_workers={options['max_tokenize_workers']} "
         f"write_manifest={options['write_manifest']})"
     )
 
