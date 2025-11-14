@@ -30,19 +30,6 @@ def _debug_print(label: str, output: tokenizer.TokenizerOutput) -> None:
         return
     print(f"--- {label} ---")
     print(f"tokens ({len(output.tokens)}): {output.tokens}")
-    print(
-        f"event_start_indices ({len(output.event_start_indices)}): "
-        f"{output.event_start_indices}"
-    )
-    print(
-        f"event_end_indices ({len(output.event_end_indices)}): "
-        f"{output.event_end_indices}"
-    )
-    print(f"state_events ({len(output.state_events)}): {output.state_events}")
-    print(
-        f"state_event_indices ({len(output.state_event_indices)}): "
-        f"{output.state_event_indices}"
-    )
     print("------------------")
 
 
@@ -80,12 +67,10 @@ def test_tokenize_basic_sequence():
     )
     _debug_print("basic_sequence", output)
     assert output.tokens, "Tokenizer should emit tokens for active notes"
-    assert len(output.event_start_indices) == FEATURE_CFG["chunk_frames"]
-    assert output.event_end_indices[-1] == len(output.tokens)
     assert vocabulary.pitch_id(60) in output.tokens
 
 
-def test_tokenize_emits_tie_state_for_continuations():
+def test_tokenize_emits_tie_tokens_for_continuations():
     ns = _build_sequence()
     output = tokenizer.tokenize_note_sequence(
         ns,
@@ -96,8 +81,25 @@ def test_tokenize_emits_tie_state_for_continuations():
         hop_length=FEATURE_CFG["hop_length"],
     )
     _debug_print("tie_state_sequence", output)
-    assert vocabulary.tie_id() in output.state_events
-    assert output.state_events.count(vocabulary.tie_id()) >= 1
+    tokens = output.tokens
+    idx = 0
+    tie_notes = 0
+    while idx < len(tokens):
+        token = tokens[idx]
+        if token == vocabulary.tie_id():
+            break
+        event_type, _ = vocabulary.decode_event(token)
+        assert event_type == "program"
+        idx += 1
+        velocity_type, _ = vocabulary.decode_event(tokens[idx])
+        assert velocity_type == "velocity"
+        idx += 1
+        pitch_type, _ = vocabulary.decode_event(tokens[idx])
+        assert pitch_type == "pitch"
+        idx += 1
+        tie_notes += 1
+    assert tie_notes > 0
+    assert idx < len(tokens) and tokens[idx] == vocabulary.tie_id()
 
 
 def _run_as_script() -> None:
@@ -105,7 +107,7 @@ def _run_as_script() -> None:
     DEBUG_OUTPUT = True
     print("Running tokenizer debug harness...\n")
     test_tokenize_basic_sequence()
-    test_tokenize_emits_tie_state_for_continuations()
+    test_tokenize_emits_tie_tokens_for_continuations()
     print("\nAll tokenizer checks passed.")
 
 

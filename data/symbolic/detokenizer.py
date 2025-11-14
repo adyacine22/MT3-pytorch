@@ -26,41 +26,60 @@ def _velocity_from_bin(bin_id: int) -> int:
     return max(1, min(max_velocity, approx))
 
 
-def _seed_active_state(
+def _consume_inline_tie_section(
+    tokens: Sequence[int],
+    start_idx: int,
     ns: note_seq.NoteSequence,
     active: Dict[Tuple[int, int, bool], note_seq.NoteSequence.Note],
-    state_events: Sequence[int],
-    limit: int,
     chunk_start_time: float,
-) -> None:
-    idx = 0
+    *,
+    populate: bool,
+) -> int:
+    """Parse leading tie events embedded in the main token stream."""
+    idx = start_idx
     program = 0
-    while idx < limit:
-        token = state_events[idx]
-        if token == vocabulary.tie_id():
-            break
+    pending_velocity: int | None = None
+    while idx < len(tokens):
+        token = tokens[idx]
+        if token in SPECIAL_TOKENS:
+            idx += 1
+            continue
         event_type, value = vocabulary.decode_event(token)
+        if event_type == "tie":
+            idx += 1
+            break
         if event_type == "program":
             program = value
-        elif event_type == "pitch":
+            idx += 1
+            continue
+        if event_type == "velocity":
+            pending_velocity = value
+            idx += 1
+            continue
+        if event_type == "pitch":
             pitch = value + MIN_MIDI_PITCH
-            note = ns.notes.add()
-            note.pitch = pitch
-            note.velocity = 100
-            note.start_time = chunk_start_time
-            note.end_time = chunk_start_time
-            note.program = program
-            note.is_drum = False
-            active[(pitch, program, False)] = note
-        idx += 1
+            if populate and (pitch, program, False) not in active:
+                velocity_bin = pending_velocity if pending_velocity is not None else vocabulary.NUM_VELOCITY_BINS
+                note = ns.notes.add()
+                note.pitch = pitch
+                note.velocity = _velocity_from_bin(velocity_bin)
+                note.start_time = chunk_start_time
+                note.end_time = chunk_start_time
+                note.program = program
+                note.is_drum = False
+                active[(pitch, program, False)] = note
+            pending_velocity = None
+            idx += 1
+            continue
+        # Any other event means the tie section has ended.
+        break
+    return idx
 
 
 def tokens_to_note_sequence(
     tokens: Sequence[int],
     chunk_start_time: float = 0.0,
-    state_events: Sequence[int] | None = None,
-    state_event_indices: Sequence[int] | None = None,
-    initial_active: Sequence[Tuple[int, int, bool, float]] | None = None,
+    initial_active: Sequence[Tuple[int, int, bool, float, int]] | None = None,
 ) -> note_seq.NoteSequence:
     """Best-effort reconstruction of a NoteSequence from tokenizer tokens."""
 
@@ -70,21 +89,24 @@ def tokens_to_note_sequence(
     active: Dict[Tuple[int, int, bool], note_seq.NoteSequence.Note] = {}
 
     if initial_active:
-        for pitch, program, is_drum, start_time in initial_active:
+        for pitch, program, is_drum, start_time, velocity in initial_active:
             note = ns.notes.add()
             note.pitch = pitch
-            note.velocity = 80
+            note.velocity = velocity
             note.start_time = start_time
             note.end_time = start_time
             note.program = program
             note.is_drum = is_drum
             active[(pitch, program, is_drum)] = note
 
-    if state_events and not initial_active:
-        initial_tokens = len(state_events)
-        if state_event_indices:
-            initial_tokens = min(initial_tokens, state_event_indices[0])
-        _seed_active_state(ns, active, state_events, initial_tokens, chunk_start_time)
+    idx = _consume_inline_tie_section(
+        tokens,
+        idx,
+        ns,
+        active,
+        chunk_start_time,
+        populate=not bool(initial_active),
+    )
 
     def add_note(pitch: int, program: int, velocity_bin: int, is_drum: bool) -> None:
         key = (pitch, program, is_drum)
@@ -134,15 +156,11 @@ def tokens_to_note_sequence(
                 break
             event_type, value = vocabulary.decode_event(tokens[idx])
 
-        if event_type != "velocity":
         if event_type == "pitch":
             # onsets-only mode without velocities
             pitch = value + MIN_MIDI_PITCH
-                velocity_bin = vocabulary.NUM_VELOCITY_BINS
-                add_note(pitch, program, velocity_bin, is_drum=False)
-                idx += 1
-                continue
-            # Unknown token sequence – skip
+            velocity_bin = vocabulary.NUM_VELOCITY_BINS
+            add_note(pitch, program, velocity_bin, is_drum=False)
             idx += 1
             continue
 

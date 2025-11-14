@@ -27,11 +27,12 @@ UNIFIED_INDEX_PATH = ROOT / DATASET_PATHS["unified_index"]
 AUDIO_CFG = CONFIG["audio"]
 FEATURE_CFG = AUDIO_CFG["features"]
 IO_CFG = AUDIO_CFG["io"]
+ARTIFACT_DIR = ROOT / "tests" / "artifacts" / "detokenizer"
 
 
 def _load_entries() -> list[dict]:
     if not UNIFIED_INDEX_PATH.exists():
-        pytest.skip("unified_index.json missing – run data/create_unified_index.py")
+        pytest.skip("unified_index.json missing – run scripts/create_unified_index.py")
     with UNIFIED_INDEX_PATH.open() as fp:
         payload = json.load(fp)
     return payload.get("entries", [])
@@ -77,6 +78,11 @@ def _trim_sequence(
     return trimmed
 
 
+def _save_midi(sequence: note_seq.NoteSequence, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    note_seq.sequence_proto_to_midi_file(sequence, str(path))
+
+
 def _sequence_signature(
     sequence: note_seq.NoteSequence, window_start: float, window_end: float
 ) -> list[tuple[int, int, bool, int, int]]:
@@ -93,13 +99,45 @@ def _sequence_signature(
     return entries
 
 
+def _token_descriptions(tokens: list[int], limit: int = 10) -> list[str]:
+    descriptions: list[str] = []
+    for token in tokens:
+        if len(descriptions) >= limit:
+            break
+        if token == vocabulary.PAD_ID:
+            descriptions.append("PAD")
+            continue
+        if token == vocabulary.EOS_ID:
+            descriptions.append("EOS")
+            continue
+        if token == vocabulary.UNK_ID:
+            descriptions.append("UNK")
+            continue
+        event_type, value = vocabulary.decode_event(token)
+        if event_type == "shift":
+            descriptions.append(f"shift+{value + 1}")
+        elif event_type == "pitch":
+            descriptions.append(f"pitch@{value + vocabulary.MIN_MIDI_PITCH}")
+        elif event_type == "velocity":
+            descriptions.append(f"vel_bin:{value}")
+        elif event_type == "program":
+            descriptions.append(f"program:{value}")
+        elif event_type == "drum":
+            descriptions.append(f"drum@{value + vocabulary.MIN_MIDI_PITCH}")
+        elif event_type == "tie":
+            descriptions.append("tie")
+        else:
+            descriptions.append(f"{event_type}:{value}")
+    return descriptions
+
+
 def _compare_sequences(
     reference: note_seq.NoteSequence,
     reconstructed: note_seq.NoteSequence,
     chunk_start: float,
     chunk_end: float,
 ) -> None:
-    step_tolerance = 2
+    step_tolerance = 0.1
     ref = _sequence_signature(reference, 0.0, chunk_end - chunk_start)
     rec = _sequence_signature(reconstructed, chunk_start, chunk_end)
     assert len(ref) == len(rec)
@@ -163,10 +201,29 @@ def test_chunkwise_tokenize_detokenize_matches_original():
                     sample_rate=IO_CFG["sample_rate"],
                     hop_length=FEATURE_CFG["hop_length"],
                 )
+                print(
+                    "    tokens=",
+                    _token_descriptions(token_output.tokens, limit=1024),
+                )
                 reconstructed = detokenizer.tokens_to_note_sequence(
                     token_output.tokens,
                     chunk_start_time=start_s,
                     initial_active=list(carry_state),
+                )
+                artifact_idx = checked + 1
+                artifact_base = ARTIFACT_DIR / dataset
+                _save_midi(
+                    chunk_ns,
+                    artifact_base / f"{artifact_idx:02d}_reference.mid",
+                )
+                reconstructed_chunk = _trim_sequence(
+                    reconstructed,
+                    start=start_s,
+                    end=end_s,
+                )
+                _save_midi(
+                    reconstructed_chunk,
+                    artifact_base / f"{artifact_idx:02d}_reconstructed.mid",
                 )
                 _compare_sequences(
                     chunk_ns,
@@ -181,6 +238,7 @@ def test_chunkwise_tokenize_detokenize_matches_original():
                         note.program,
                         bool(note.is_drum),
                         note.start_time,
+                        note.velocity,
                     )
                     for note in reconstructed.notes
                     if note.end_time >= end_s - 1e-3
@@ -191,6 +249,67 @@ def test_chunkwise_tokenize_detokenize_matches_original():
             start_s += chunk_duration
         assert checked > 0, f"No chunks with notes for dataset {dataset}"
         print(f"[summary] {dataset}: validated {checked} chunks")
+
+
+def test_tokenizer_condenses_shift_events():
+    start_time = 0.5
+    ns = note_seq.NoteSequence()
+    note = ns.notes.add()
+    note.pitch = 60
+    note.velocity = 90
+    note.start_time = start_time
+    note.end_time = start_time + 0.1
+    note.program = 0
+    ns.total_time = 1.0
+    chunk_end = 1.0
+    token_output = tokenizer.tokenize_note_sequence(
+        ns,
+        chunk_start_s=0.0,
+        chunk_end_s=chunk_end,
+        num_frames=FEATURE_CFG["chunk_frames"],
+        sample_rate=IO_CFG["sample_rate"],
+        hop_length=FEATURE_CFG["hop_length"],
+    )
+    expected_steps = round(start_time * vocabulary.STEPS_PER_SECOND)
+    shift_tokens: list[int] = []
+    for token in token_output.tokens:
+        if token in (vocabulary.PAD_ID, vocabulary.EOS_ID, vocabulary.UNK_ID):
+            continue
+        event_type, value = vocabulary.decode_event(token)
+        if event_type == "shift":
+            shift_tokens.append(value + 1)
+        else:
+            break
+    assert shift_tokens, "Tokenizer should emit a shift before the first onset."
+    assert len(shift_tokens) == 1, "Shift events should be condensed into a single token."
+    assert shift_tokens[0] == expected_steps
+
+
+def test_tokenizer_injects_tie_tokens():
+    ns = note_seq.NoteSequence()
+    note = ns.notes.add()
+    note.pitch = 64
+    note.velocity = 80
+    note.start_time = 0.1
+    note.end_time = 1.2
+    note.program = 3
+    ns.total_time = 1.5
+
+    token_output = tokenizer.tokenize_note_sequence(
+        ns,
+        chunk_start_s=0.5,
+        chunk_end_s=1.5,
+        num_frames=FEATURE_CFG["chunk_frames"],
+        sample_rate=IO_CFG["sample_rate"],
+        hop_length=FEATURE_CFG["hop_length"],
+    )
+    first_tokens = token_output.tokens[:4]
+    assert len(first_tokens) >= 4
+    event_types = [vocabulary.decode_event(tok)[0] if tok >= vocabulary.SPECIAL_OFFSET else None for tok in first_tokens]
+    assert event_types[0] == "program"
+    assert event_types[1] == "velocity"
+    assert event_types[2] == "pitch"
+    assert first_tokens[3] == vocabulary.tie_id()
 
 
 def _run_as_script() -> None:

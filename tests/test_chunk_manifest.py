@@ -12,6 +12,7 @@ if str(ROOT) not in sys.path:
 
 from configs import load_project_config
 from configs.project_config import PROJECT_ROOT
+from data.preprocessing.manifest import MANIFEST_REQUIRED_COLUMNS
 
 
 CONFIG = load_project_config()
@@ -24,22 +25,7 @@ def test_chunk_manifest_parquet_schema():
     df = pd.read_parquet(MANIFEST_PATH)
     print(f"Loaded chunk manifest with {len(df)} rows from {MANIFEST_PATH}")
 
-    required_columns = [
-        "chunk_id",
-        "track_id",
-        "dataset",
-        "split",
-        "audio_path",
-        "midi_path",
-        "chunk_start_ms",
-        "chunk_end_ms",
-        "chunk_duration_ms",
-        "chunk_frames",
-        "chunk_samples",
-        "sample_rate",
-        "hop_length",
-    ]
-    for col in required_columns:
+    for col in MANIFEST_REQUIRED_COLUMNS:
         assert col in df.columns, f"Missing column '{col}' in manifest"
 
     # Basic sanity checks

@@ -21,6 +21,8 @@ CODEC_CFG = SYMBOLIC_CFG["codec"]
 TOKENIZER_CFG = SYMBOLIC_CFG.get("tokenizer", {})
 STEPS_PER_SECOND = CODEC_CFG["steps_per_second"]
 NUM_VELOCITY_BINS = max(1, CODEC_CFG["num_velocity_bins"])
+SHIFT_RANGE = next(r for r in vocabulary.EVENT_RANGES if r.name == "shift")
+MAX_SHIFT_STEPS = SHIFT_RANGE.max_id - SHIFT_RANGE.min_id + 1
 
 
 @dataclass
@@ -43,19 +45,9 @@ class NoteEncodingState:
 @dataclass
 class TokenizerOutput:
     tokens: List[int]
-    event_start_indices: List[int]
-    event_end_indices: List[int]
-    state_events: List[int]
-    state_event_indices: List[int]
 
     def to_dict(self) -> Dict[str, List[int]]:
-        return {
-            "tokens": self.tokens,
-            "event_start_indices": self.event_start_indices,
-            "event_end_indices": self.event_end_indices,
-            "state_events": self.state_events,
-            "state_event_indices": self.state_event_indices,
-        }
+        return {"tokens": self.tokens}
 
 
 def tokenize_note_sequence(
@@ -84,7 +76,7 @@ def tokenize_note_sequence(
         onsets_only: Override config to emit only onset events.
 
     Returns:
-        TokenizerOutput with tokens, alignment indices, and state events.
+        TokenizerOutput with tokens and state events.
     """
 
     if chunk_end_s <= chunk_start_s:
@@ -96,7 +88,6 @@ def tokenize_note_sequence(
     onsets_only_flag: bool = (
         TOKENIZER_CFG.get("onsets_only", False) if onsets_only is None else onsets_only
     )
-
     sr = sample_rate or IO_CFG["sample_rate"]
     hop = hop_length or FEATURE_CFG["hop_length"]
     frame_times = list(frame_times or _default_frame_times(num_frames, hop, sr))
@@ -117,26 +108,14 @@ def tokenize_note_sequence(
         onsets_only=onsets_only_flag,
     )
 
-    (
-        tokens,
-        event_start_indices,
-        event_end_indices,
-        state_events,
-        state_event_indices,
-    ) = _encode_and_index_events(
+    tokens = _encode_events(
         state=state if include_ties_flag else None,
         event_times=event_times,
         event_values=event_values,
         frame_times=frame_times,
     )
 
-    return TokenizerOutput(
-        tokens=tokens,
-        event_start_indices=event_start_indices,
-        event_end_indices=event_end_indices,
-        state_events=state_events,
-        state_event_indices=state_event_indices,
-    )
+    return TokenizerOutput(tokens=tokens)
 
 
 def _default_frame_times(
@@ -241,66 +220,48 @@ def _collect_note_events(
     return times, values
 
 
-def _encode_and_index_events(
+def _encode_events(
     *,
     state: NoteEncodingState | None,
     event_times: Sequence[float],
     event_values: Sequence[NoteEventData],
     frame_times: Sequence[float],
-) -> Tuple[List[int], List[int], List[int], List[int], List[int]]:
+) -> List[int]:
     indices = np.argsort(event_times, kind="stable")
     event_steps = [round(event_times[i] * STEPS_PER_SECOND) for i in indices]
     event_values = [event_values[i] for i in indices]
 
     events: List[int] = []
-    state_events: List[int] = []
-    event_start_indices: List[int] = []
-    state_event_indices: List[int] = []
-
     cur_step = 0
-    cur_event_idx = 0
-    cur_state_event_idx = 0
 
-    def fill_indices() -> None:
-        nonlocal event_start_indices, state_event_indices
-        while (
-            len(event_start_indices) < len(frame_times)
-            and frame_times[len(event_start_indices)] < cur_step / STEPS_PER_SECOND
-        ):
-            event_start_indices.append(cur_event_idx)
-            state_event_indices.append(cur_state_event_idx)
+    if state is not None:
+        tie_tokens = _state_to_tokens(state)
+        if tie_tokens:
+            events.extend(tie_tokens)
+
+    def emit_shift_steps(steps: int) -> None:
+        nonlocal cur_step
+        remaining = steps
+        while remaining > 0:
+            chunk = min(remaining, MAX_SHIFT_STEPS)
+            events.append(vocabulary.shift_id(chunk))
+            cur_step += chunk
+            remaining -= chunk
 
     for event_step, value in zip(event_steps, event_values):
-        while event_step > cur_step:
-            events.append(vocabulary.shift_id(1))
-            cur_step += 1
-            fill_indices()
-            cur_event_idx = len(events)
-            cur_state_event_idx = len(state_events)
-
-        if state is not None:
-            tie_events = _state_to_tokens(state)
-            if tie_events:
-                state_events.extend(tie_events)
-                cur_state_event_idx = len(state_events)
+        if event_step > cur_step:
+            emit_shift_steps(event_step - cur_step)
 
         encoded = _encode_note_event(state, value)
         events.extend(encoded)
 
     if frame_times:
-        while cur_step / STEPS_PER_SECOND <= frame_times[-1]:
-            events.append(vocabulary.shift_id(1))
-            cur_step += 1
-            fill_indices()
-            cur_event_idx = len(events)
+        required_step = int(math.floor(frame_times[-1] * STEPS_PER_SECOND)) + 1
+        final_step = max(cur_step, required_step)
+        if final_step > cur_step:
+            emit_shift_steps(final_step - cur_step)
 
-    # Ensure indices cover all frames.
-    while len(event_start_indices) < len(frame_times):
-        event_start_indices.append(cur_event_idx)
-        state_event_indices.append(cur_state_event_idx)
-
-    event_end_indices = event_start_indices[1:] + [len(events)]
-    return events, event_start_indices, event_end_indices, state_events, state_event_indices
+    return events
 
 
 def _encode_note_event(
@@ -334,6 +295,8 @@ def _state_to_tokens(state: NoteEncodingState) -> List[int]:
     for pitch, program in sorted(state.active_pitches.keys(), key=lambda k: (k[1], k[0])):
         if state.active_pitches[(pitch, program)]:
             tokens.append(vocabulary.program_id(program))
+            velocity_bin = state.active_pitches[(pitch, program)]
+            tokens.append(vocabulary.velocity_id(velocity_bin))
             tokens.append(vocabulary.pitch_id(pitch))
     if not tokens:
         return []

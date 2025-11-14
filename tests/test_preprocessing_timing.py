@@ -57,7 +57,24 @@ FEATURE_CFG = AUDIO_CFG["features"]
 IO_CFG = AUDIO_CFG["io"]
 PREPROCESS_CFG = AUDIO_CFG["preprocess"]
 PATH_CFG = CONFIG["paths"]["datasets"]
-COMPUTE_CFG = CONFIG.get("compute", {}).get("preprocessing", {})
+PREPROCESS_SECTION = CONFIG.get("compute", {}).get("preprocessing", {})
+
+
+def _resolve_preprocess_profile(section: Dict[str, Any], env_value: str | None) -> Tuple[Dict[str, Any], str]:
+    if "profiles" not in section:
+        return dict(section), env_value or "default"
+    profiles = section.get("profiles") or {}
+    if not profiles:
+        return dict(section), env_value or "default"
+    default_profile = section.get("default_profile")
+    profile_name = env_value or default_profile
+    if not profile_name or profile_name not in profiles:
+        profile_name = default_profile if default_profile in profiles else next(iter(profiles))
+    return dict(profiles[profile_name]), profile_name
+
+
+PROFILE_OVERRIDE = os.environ.get("PREPROCESS_PROFILE") or os.environ.get("PRECOMPUTE_PROFILE")
+COMPUTE_CFG, COMPUTE_PROFILE = _resolve_preprocess_profile(PREPROCESS_SECTION, PROFILE_OVERRIDE)
 OVERRIDES = os.environ.get("PREPROCESS_TIMING_OVERRIDES")
 if OVERRIDES:
     try:
@@ -586,6 +603,7 @@ def _print_report(results: Dict[str, Dict[str, Any]], elapsed_time: float) -> No
         f"batch_size={BATCH_SIZE} | "
         f"max_tokenize_workers={MAX_TOKENIZE_WORKERS} | "
         f"chunk_device_pref={CHUNK_DEVICE_PREF} | "
+        f"profile={COMPUTE_PROFILE} | "
         f"augment_profiles={AUGMENT_PROFILES}"
     )
     _log("Preprocessing timings per dataset (seconds):")

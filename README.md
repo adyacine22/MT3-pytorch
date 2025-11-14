@@ -102,6 +102,30 @@ Test categories:
 - Integration tests (dataset loading, model I/O)
 - Device tests (CPU, CUDA, MPS support)
 
+### Chunk dataset profiling
+
+Use the performance harnesses in `tests/` to sanity check data IO and tokenization:
+
+```bash
+# Profile tokenization cost while sweeping max_examples_per_mix
+pytest tests/test_chunk_tokenization_profile.py -v
+
+# Profile DataLoader throughput
+pytest tests/test_chunk_dataloader_profile.py -v
+```
+
+Both tests read the default manifest from `cache/chunk_manifest.parquet`. Override paths or knobs with env vars, e.g.:
+
+```bash
+export CHUNK_TOKEN_PROFILE_MANIFEST=datasets/custom_manifest.parquet
+export CHUNK_TOKEN_PROFILE_MIX_VALUES="1,2,4"
+export CHUNK_TOKEN_PROFILE_SAMPLES=32
+export CHUNK_TOKEN_PROFILE_DATASET='{"feature_type": "waveform", "load_tokens": true}'
+pytest tests/test_chunk_tokenization_profile.py -v
+```
+
+Each run writes JSON logs under `test_files/test_chunk_tokenization_profile/` for later comparison.
+
 ---
 
 ## Training

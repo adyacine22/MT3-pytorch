@@ -2,49 +2,46 @@
 """Generate chunk-level manifest entries from the unified dataset index."""
 
 from __future__ import annotations
-import sys
+
 import argparse
 import json
 import logging
 import math
+import sys
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List
 
 if str(Path(__file__).resolve().parents[1]) not in sys.path:
     sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-from configs import load_project_config
-from configs.project_config import PROJECT_ROOT
+from data.preprocessing.options import PrecomputeOptions, load_precompute_options
+from data.preprocessing.storage import slugify
 
 
 logger = logging.getLogger(__name__)
 
 
 def parse_args() -> argparse.Namespace:
-    cfg = load_project_config()
-    dataset_paths = cfg["paths"]["datasets"]
-    cache_paths = cfg["paths"]["cache"]
-
     parser = argparse.ArgumentParser(
         description="Generate chunk manifest from unified_index.json."
     )
     parser.add_argument(
         "--unified-index",
         type=Path,
-        default=PROJECT_ROOT / dataset_paths["unified_index"],
-        help="Path to unified_index.json",
+        default=None,
+        help="Path to unified_index.json (defaults to config path).",
     )
     parser.add_argument(
         "--output",
         type=Path,
-        default=PROJECT_ROOT / cache_paths["chunk_manifest"],
-        help="Output manifest path (json/jsonl/parquet)",
+        default=None,
+        help="Output manifest path (json/jsonl/parquet).",
     )
     parser.add_argument(
         "--chunk-duration-ms",
         type=float,
         default=None,
-        help="Override chunk duration in milliseconds (defaults from config).",
+        help="Override chunk duration in milliseconds (defaults from profile).",
     )
     return parser.parse_args()
 
@@ -53,7 +50,7 @@ def load_unified_entries(unified_index_path: Path) -> List[Dict]:
     if not unified_index_path.exists():
         raise FileNotFoundError(
             f"Unified index not found at {unified_index_path}. "
-            "Run data/create_unified_index.py first."
+            "Run scripts/create_unified_index.py first."
         )
     with unified_index_path.open() as fp:
         payload = json.load(fp)
@@ -76,35 +73,42 @@ def generate_jobs(
     entries: Iterable[Dict],
     chunk_duration_ms: float,
     chunk_frames: int,
-    chunk_samples: int,
-    sample_rate: int,
-    hop_length: int,
-    compute_cfg: Dict,
+    options: PrecomputeOptions,
     precomputed_dir: Path,
 ) -> List[Dict]:
     jobs: List[Dict] = []
-    augment_enabled = bool(compute_cfg.get("augment_enabled", False))
-    augment_profiles = compute_cfg.get("augment_profiles", ["none"])
-    if isinstance(augment_profiles, str):
-        augment_profiles = [augment_profiles]
-
+    chunk_storage = options.chunk_storage
+    augment_enabled = options.augment_enabled
+    augment_profiles = options.augment_profiles if augment_enabled else ["none"]
+    chunk_samples = options.chunk_samples
+    hop_length = options.hop_length
+    sample_rate = options.sample_rate
+    allowed_datasets = set(options.datasets) if options.datasets else None
+    logger.info("Allowed datasets: %s", allowed_datasets)
+    i=0
     for entry in entries:
         duration_ms = compute_duration_ms(entry)
         if duration_ms <= 0:
             logger.debug("Skipping %s (no duration info)", entry["track_id"])
             continue
-
         dataset = entry["dataset"]
+        if allowed_datasets and dataset not in allowed_datasets:
+            logger.debug("Skipping %s (not in allowed datasets)", entry["track_id"])
+            continue
         track_id = entry["track_id"]
-
+        audio_path = entry.get("audio_path", "")
+        track_slug = slugify(track_id, Path(audio_path).stem if audio_path else track_id)
         # Determine number of chunks (non-overlapping windows)
         num_chunks = max(1, math.ceil(duration_ms / chunk_duration_ms))
+        if (i % 10000) == 0:
+            logger.info("Generating %d chunks for track %s", num_chunks, track_id)
         for idx in range(num_chunks):
             start_ms = idx * chunk_duration_ms
             end_ms = min(duration_ms, start_ms + chunk_duration_ms)
             actual_duration = end_ms - start_ms
 
             chunk_id = f"{track_id}-chunk{idx:05d}"
+            chunk_slug = f"chunk_{idx:05d}"
             stem_ids = []
             if dataset == "slakh_full_mix":
                 stem_ids = entry.get("rendered_stem_ids", []) or []
@@ -112,6 +116,11 @@ def generate_jobs(
                 stem = entry.get("stem_id")
                 if stem:
                     stem_ids = [stem]
+            if chunk_storage == "per_track":
+                storage_rel = Path(dataset) / f"{track_slug}.pt"
+            else:
+                storage_rel = Path(dataset) / track_slug / f"{chunk_slug}.pt"
+            precomputed_path = (precomputed_dir / storage_rel).as_posix()
 
             job = {
                 "chunk_id": chunk_id,
@@ -120,6 +129,9 @@ def generate_jobs(
                 "split": entry.get("split"),
                 "audio_path": entry["audio_path"],
                 "midi_path": entry["midi_path"],
+                "chunk_index": idx,
+                "chunk_start_s": start_ms / 1000.0,
+                "chunk_end_s": end_ms / 1000.0,
                 "chunk_start_ms": start_ms,
                 "chunk_end_ms": end_ms,
                 "chunk_duration_ms": actual_duration,
@@ -135,16 +147,21 @@ def generate_jobs(
                 "instrument_classes": entry.get("instrument_classes", []),
                 "is_drum": bool(entry.get("is_drum", False)),
                 "metadata_hash": f"{track_id}-{start_ms:.0f}-{end_ms:.0f}",
-                "precomputed_path": str((precomputed_dir / f"{chunk_id}.pt").as_posix()),
+                "precomputed_path": precomputed_path,
+                "chunk_path": precomputed_path,
+                "chunk_storage": chunk_storage,
+                "chunk_shard_path": precomputed_path,
+                "chunk_shard_index": idx,
                 "precompute": {
-                    "chunk_device": compute_cfg.get("chunk_device", "auto"),
-                    "batch_size": compute_cfg.get("batch_size"),
-                    "max_tokenize_workers": compute_cfg.get("max_tokenize_workers"),
+                    "chunk_device": options.chunk_device or "auto",
+                    "batch_size": options.batch_size,
+                    "max_tokenize_workers": options.max_tokenize_workers,
                     "augment_enabled": augment_enabled,
-                    "augment_profiles": augment_profiles if augment_enabled else ["none"],
+                    "augment_profiles": augment_profiles,
                 },
             }
             jobs.append(job)
+            i += 1
     logger.info("Generated %d chunk jobs", len(jobs))
     return jobs
 
@@ -182,29 +199,24 @@ def main() -> None:
     args = parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
 
-    cfg = load_project_config()
-    audio_cfg = cfg["audio"]
-    sample_rate = audio_cfg["io"]["sample_rate"]
-    feature_cfg = audio_cfg["features"]
-    chunk_samples = feature_cfg["chunk_samples"]
-    chunk_duration_default = chunk_samples / sample_rate * 1000.0
+    config, options_dict, default_unified, output_root, default_manifest = load_precompute_options()
+    options = PrecomputeOptions(**options_dict)
+    chunk_duration_default = options.chunk_samples / options.sample_rate * 1000.0
     chunk_duration_ms = args.chunk_duration_ms or chunk_duration_default
-    compute_cfg = cfg.get("compute", {}).get("preprocessing", {})
-    cache_paths = cfg["paths"]["cache"]
-    precomputed_dir = PROJECT_ROOT / cache_paths.get("precomputed_chunks", Path(cache_paths["root"]) / "precomputed_chunks")
+    unified_index_path = (args.unified_index or default_unified).expanduser().resolve()
+    output_path = (args.output or default_manifest).expanduser().resolve()
+    precomputed_dir = output_root
+    logger.info("Using preprocessing profile '%s' for manifest generation", options.profile_name)
 
-    entries = load_unified_entries(args.unified_index)
+    entries = load_unified_entries(unified_index_path)
     jobs = generate_jobs(
         entries=entries,
         chunk_duration_ms=chunk_duration_ms,
-        chunk_frames=feature_cfg["chunk_frames"],
-        chunk_samples=chunk_samples,
-        sample_rate=sample_rate,
-        hop_length=feature_cfg["hop_length"],
-        compute_cfg=compute_cfg,
+        chunk_frames=config["audio"]["features"]["chunk_frames"],
+        options=options,
         precomputed_dir=precomputed_dir,
     )
-    save_manifest(jobs, args.output)
+    save_manifest(jobs, output_path)
     logger.info("Chunk manifest generation complete.")
 
 

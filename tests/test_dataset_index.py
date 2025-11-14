@@ -21,7 +21,7 @@ INDEX_PATH = (REPO_ROOT / DATASET_PATHS["unified_index"]).resolve()
 def _load_entries():
     if not INDEX_PATH.exists():
         raise FileNotFoundError(
-            f"Unified index missing at {INDEX_PATH}. Run data/create_unified_index.py first."
+            f"Unified index missing at {INDEX_PATH}. Run scripts/create_unified_index.py first."
         )
     with INDEX_PATH.open() as fp:
         payload = json.load(fp)
